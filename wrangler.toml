@@ -10,9 +10,9 @@ compatibility_flags = ["nodejs_compat"]
 # Secrets (set via `wrangler secret put`):
 # RELAY_SECRET — HMAC signing key for session tokens
 
-# Local dev vars (NOT used in production — use `wrangler secret put` for prod)
-[vars]
-RELAY_SECRET = "dev-secret-do-not-use-in-production"
+# RELAY_SECRET is set via `wrangler secret put RELAY_SECRET` for production.
+# For local dev, create a .dev.vars file (gitignored):
+#   RELAY_SECRET=your-dev-secret-here
 
 # Durable Objects
 [durable_objects]

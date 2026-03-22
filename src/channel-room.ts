@@ -35,8 +35,7 @@ interface SessionState {
   appSessionId: string | null;
   /** Whether pairing is complete */
   paired: boolean;
-  /** Last 10 messages for reconnection buffer */
-  messageBuffer: BufferedMessage[];
+  // messageBuffer removed — kept in volatile memory only (see volatileBuffer)
   /** Timestamp of last activity */
   lastActivity: number;
 }
@@ -52,6 +51,7 @@ type WebSocketRole = "plugin" | "app";
 const PAIRING_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const MESSAGE_BUFFER_SIZE = 10;
 const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_MESSAGE_SIZE = 256 * 1024; // 256KB max message size
 
 /** Send a JSON message to a WebSocket, silently ignoring errors (e.g. disconnected). */
 function trySendJson(ws: WebSocket, payload: Record<string, unknown>): void {
@@ -66,6 +66,13 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
   private session: SessionState | null = null;
   private pluginWs: WebSocket | null = null;
   private appWs: WebSocket | null = null;
+
+  /**
+   * In-memory only message buffer for reconnection.
+   * NOT persisted to storage — messages are lost if the DO evicts.
+   * This is intentional: we don't store user content on disk.
+   */
+  private volatileBuffer: BufferedMessage[] = [];
 
   constructor(ctx: DurableObjectState, env: { RELAY_SECRET: string }) {
     super(ctx, env);
@@ -112,7 +119,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       pluginSessionId,
       appSessionId: null,
       paired: false,
-      messageBuffer: [],
       lastActivity: Date.now(),
     };
 
@@ -356,8 +362,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
    * Deliver buffered messages from a specific sender to the reconnected side.
    */
   private deliverBufferedMessages(ws: WebSocket, fromRole: WebSocketRole): void {
-    if (!this.session) return;
-    const toDeliver = this.session.messageBuffer.filter((m) => m.from === fromRole);
+    const toDeliver = this.volatileBuffer.filter((m) => m.from === fromRole);
     for (const msg of toDeliver) {
       try {
         ws.send(msg.data);
@@ -365,20 +370,18 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         break;
       }
     }
-    // Remove delivered messages from buffer
-    this.session.messageBuffer = this.session.messageBuffer.filter((m) => m.from !== fromRole);
+    this.volatileBuffer = this.volatileBuffer.filter((m) => m.from !== fromRole);
   }
 
   /**
    * Buffer a message for reconnection delivery.
    */
-  private async bufferMessage(from: WebSocketRole, data: string): Promise<void> {
-    if (!this.session) return;
-    this.session.messageBuffer.push({ from, data, timestamp: Date.now() });
-    if (this.session.messageBuffer.length > MESSAGE_BUFFER_SIZE) {
-      this.session.messageBuffer.shift();
+  private bufferMessage(from: WebSocketRole, data: string): void {
+    this.volatileBuffer.push({ from, data, timestamp: Date.now() });
+    if (this.volatileBuffer.length > MESSAGE_BUFFER_SIZE) {
+      this.volatileBuffer.shift();
     }
-    await this.ctx.storage.put("session", this.session);
+    // Intentionally NOT persisted to storage — user content stays in memory only
   }
 
   /**
@@ -389,6 +392,13 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     if (!this.session) return;
 
     const data = typeof message === "string" ? message : new TextDecoder().decode(message);
+
+    // Enforce message size limit
+    if (data.length > MAX_MESSAGE_SIZE) {
+      trySendJson(ws, { type: "error", message: "Message too large (max 256KB)" });
+      return;
+    }
+
     const tags = this.ctx.getTags(ws);
     const role = tags.includes("plugin") ? "plugin" : "app";
 
