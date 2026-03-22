@@ -168,10 +168,17 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       return Response.json(result);
     }
 
-    // GET /ws — WebSocket upgrade
-    if (url.pathname === "/ws") {
-      const role = url.searchParams.get("role") as WebSocketRole | null;
-      const token = url.searchParams.get("token");
+    // WebSocket upgrade — the worker forwards the original request, so
+    // we see the public URL paths (/ws/plugin, /ws/app) and their params.
+    // Also support /ws?role=... for local dev / tests.
+    if (url.pathname === "/ws/plugin" || url.pathname === "/ws/app" || url.pathname === "/ws") {
+      // Determine role from path or query param
+      let role: WebSocketRole | null = null;
+      if (url.pathname === "/ws/plugin") role = "plugin";
+      else if (url.pathname === "/ws/app") role = "app";
+      else role = url.searchParams.get("role") as WebSocketRole | null;
+
+      const token = url.searchParams.get("session") ?? url.searchParams.get("token");
       const code = url.searchParams.get("code");
 
       if (role === "plugin" && token) {
