@@ -70,11 +70,15 @@ export default {
         return jsonResponse({ error: "Invalid session token" }, 403);
       }
 
-      // Forward the ORIGINAL request to the DO — this preserves CF's
-      // internal WebSocket upgrade flag that new Request() strips.
       const doId = env.CHANNEL_ROOM.idFromName(sessionId);
       const stub = env.CHANNEL_ROOM.get(doId);
-      return stub.fetch(request);
+
+      // Use two-arg form: stub.fetch(url, request) — passes the original
+      // request as RequestInit, which preserves CF's WebSocket metadata.
+      // Pattern from CF's own chat demo: roomObject.fetch(newUrl, request)
+      const doUrl = new URL(request.url);
+      doUrl.pathname = "/ws/plugin";
+      return stub.fetch(doUrl.toString(), request);
     }
 
     // ── GET /ws/app — App WebSocket (pairing or reconnect) ──
@@ -94,7 +98,8 @@ export default {
 
         const doId = env.CHANNEL_ROOM.idFromName(sessionId);
         const stub = env.CHANNEL_ROOM.get(doId);
-        return stub.fetch(request);
+        // Two-arg form preserves WebSocket upgrade metadata from request
+        return stub.fetch(url.toString(), request);
       }
 
       if (sessionToken) {
@@ -106,7 +111,7 @@ export default {
 
         const doId = env.CHANNEL_ROOM.idFromName(sessionId);
         const stub = env.CHANNEL_ROOM.get(doId);
-        return stub.fetch(request);
+        return stub.fetch(url.toString(), request);
       }
 
       return jsonResponse({ error: "Missing code or session parameter" }, 400);
