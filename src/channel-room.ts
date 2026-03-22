@@ -74,6 +74,14 @@ export class ChannelRoom implements DurableObject {
   constructor(state: DurableObjectState, env: { RELAY_SECRET: string }) {
     this.state = state;
     this.env = env;
+
+    // Restore session from storage if DO was evicted and re-instantiated
+    this.state.blockConcurrencyWhile(async () => {
+      const saved = await this.state.storage.get<SessionState>("session");
+      if (saved) {
+        this.session = saved;
+      }
+    });
   }
 
   private getSession(): SessionState {
@@ -100,7 +108,8 @@ export class ChannelRoom implements DurableObject {
       lastActivity: Date.now(),
     };
 
-    // Schedule cleanup alarm
+    // Persist and schedule cleanup
+    await this.state.storage.put("session", this.session);
     await this.state.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
 
     return { code, sessionToken };
@@ -110,6 +119,16 @@ export class ChannelRoom implements DurableObject {
    * HTTP fetch handler — used for the pairing code lookup.
    */
   async fetch(request: Request): Promise<Response> {
+    try {
+      return await this._fetch(request);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[ChannelRoom] Error: ${msg}`);
+      return Response.json({ error: msg }, { status: 500 });
+    }
+  }
+
+  private async _fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     // ── Pairing registry endpoints (only for "__pairing_registry__" DO) ──
@@ -238,6 +257,9 @@ export class ChannelRoom implements DurableObject {
     this.session.pairingCode = null;
     this.session.pairingExpiresAt = null;
     this.session.lastActivity = Date.now();
+
+    // Persist updated session
+    await this.state.storage.put("session", this.session);
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
