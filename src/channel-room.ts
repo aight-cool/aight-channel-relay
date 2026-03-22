@@ -69,14 +69,15 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
   constructor(ctx: DurableObjectState, env: { RELAY_SECRET: string }) {
     super(ctx, env);
+  }
 
-    // Restore session from storage if DO was evicted and re-instantiated
-    this.ctx.blockConcurrencyWhile(async () => {
-      const saved = await this.ctx.storage.get<SessionState>("session");
-      if (saved) {
-        this.session = saved;
-      }
-    });
+  /** Lazy-load session from storage on first access */
+  private async ensureSession(): Promise<void> {
+    if (this.session) return;
+    const saved = await this.ctx.storage.get<SessionState>("session");
+    if (saved) {
+      this.session = saved;
+    }
   }
 
   private getSession(): SessionState {
@@ -129,6 +130,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
   }
 
   private async _fetch(request: Request): Promise<Response> {
+    await this.ensureSession();
     const url = new URL(request.url);
 
     // ── Pairing registry endpoints (only for "__pairing_registry__" DO) ──
@@ -389,6 +391,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
    * WebSocket message handler (called by Durable Object runtime).
    */
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    await this.ensureSession();
     if (!this.session) return;
 
     const data = typeof message === "string" ? message : new TextDecoder().decode(message);
