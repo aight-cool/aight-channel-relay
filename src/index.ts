@@ -25,14 +25,41 @@ export interface Env {
   CHANNEL_ROOM: DurableObjectNamespace;
 }
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
+/**
+ * CORS: Allow requests from the Aight app (native, no origin header)
+ * and localhost for development. Block other origins.
+ */
+const ALLOWED_ORIGINS = new Set([
+  "capacitor://localhost",
+  "http://localhost",
+  "http://localhost:8081",
+  "http://localhost:19006",
+]);
 
+function getCorsHeaders(request: Request): Record<string, string> {
+  const origin = request.headers.get("Origin");
+  // Native apps send no Origin header — allow those.
+  // For browser requests, only allow known origins.
+  const allowOrigin = !origin || ALLOWED_ORIGINS.has(origin) ? (origin ?? "*") : "";
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
+}
+
+// Note: jsonResponse doesn't have request context for CORS.
+// WebSocket upgrades (the sensitive paths) don't use CORS anyway.
+// This is defense-in-depth for the REST endpoints only.
 function jsonResponse(data: unknown, status = 200): Response {
-  return Response.json(data, { status, headers: CORS_HEADERS });
+  return Response.json(data, {
+    status,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    },
+  });
 }
 
 export default {
@@ -40,7 +67,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return new Response(null, { status: 204, headers: getCorsHeaders(request) });
     }
 
     // ── Health check ──
