@@ -194,6 +194,15 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       return Response.json({ error: "Invalid parameters" }, { status: 400 });
     }
 
+    // Debug: version check
+    if (url.pathname === "/version") {
+      return Response.json({
+        version: "0.1.1",
+        hasSession: !!this.session,
+        className: this.constructor.name,
+      });
+    }
+
     return Response.json({ error: "Not found" }, { status: 404 });
   }
 

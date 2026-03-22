@@ -48,7 +48,7 @@ export default {
       return jsonResponse({
         ok: true,
         service: "aight-channel-relay",
-        version: "0.1.0",
+        version: "0.1.1-ws-fix",
       });
     }
 
