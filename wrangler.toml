@@ -1,0 +1,25 @@
+name = "channel-relay"
+main = "src/index.ts"
+account_id = "09385734b0e448260193c7f758a44d0b"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Custom domain: channels.aight.cool (configure in Cloudflare dashboard)
+# routes = [{ pattern = "channels.aight.cool/*", zone_name = "aight.cool" }]
+
+# Secrets (set via `wrangler secret put`):
+# RELAY_SECRET — HMAC signing key for session tokens
+
+# Local dev vars (NOT used in production — use `wrangler secret put` for prod)
+[vars]
+RELAY_SECRET = "dev-secret-do-not-use-in-production"
+
+# Durable Objects
+[durable_objects]
+bindings = [
+  { name = "CHANNEL_ROOM", class_name = "ChannelRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["ChannelRoom"]
