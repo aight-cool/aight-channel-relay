@@ -311,7 +311,7 @@ describe("Message Buffering", () => {
     for (let i = 0; i < 15; i++) {
       plugin.ws.send(`{"content":"msg-${i}"}`);
     }
-    await sleep(20);
+    await sleep(100);
 
     const app2 = await connectWs(stub, `https://do/ws?role=app&token=${appToken}`);
 
