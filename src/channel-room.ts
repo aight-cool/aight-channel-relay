@@ -68,9 +68,6 @@ export class ChannelRoom implements DurableObject {
   private pluginWs: WebSocket | null = null;
   private appWs: WebSocket | null = null;
 
-  /** Pairing code registry (only used by the "__pairing_registry__" instance) */
-  private codeRegistry = new Map<string, CodeEntry>();
-
   constructor(state: DurableObjectState, env: { RELAY_SECRET: string }) {
     this.state = state;
     this.env = env;
@@ -135,10 +132,11 @@ export class ChannelRoom implements DurableObject {
 
     if (url.pathname === "/register-code" && request.method === "POST") {
       const { code, sessionId } = await request.json<{ code: string; sessionId: string }>();
-      this.codeRegistry.set(code, {
+      // Persist to DO storage so it survives eviction
+      await this.state.storage.put(`code:${code}`, {
         sessionId,
         expiresAt: Date.now() + PAIRING_CODE_TTL_MS,
-      });
+      } satisfies CodeEntry);
       return Response.json({ ok: true });
     }
 
@@ -146,15 +144,15 @@ export class ChannelRoom implements DurableObject {
       const code = url.searchParams.get("code");
       if (!code) return Response.json({ error: "Missing code" }, { status: 400 });
 
-      const entry = this.codeRegistry.get(code);
+      const entry = await this.state.storage.get<CodeEntry>(`code:${code}`);
       if (!entry) return Response.json({ error: "Unknown code" }, { status: 404 });
       if (Date.now() > entry.expiresAt) {
-        this.codeRegistry.delete(code);
+        await this.state.storage.delete(`code:${code}`);
         return Response.json({ error: "Code expired" }, { status: 410 });
       }
 
       // Delete code after successful lookup (one-time use)
-      this.codeRegistry.delete(code);
+      await this.state.storage.delete(`code:${code}`);
       return Response.json({ sessionId: entry.sessionId });
     }
 
@@ -348,12 +346,13 @@ export class ChannelRoom implements DurableObject {
   /**
    * Buffer a message for reconnection delivery.
    */
-  private bufferMessage(from: WebSocketRole, data: string): void {
+  private async bufferMessage(from: WebSocketRole, data: string): Promise<void> {
     if (!this.session) return;
     this.session.messageBuffer.push({ from, data, timestamp: Date.now() });
     if (this.session.messageBuffer.length > MESSAGE_BUFFER_SIZE) {
       this.session.messageBuffer.shift();
     }
+    await this.state.storage.put("session", this.session);
   }
 
   /**
@@ -455,6 +454,7 @@ export class ChannelRoom implements DurableObject {
         }
       }
       this.session = null;
+      await this.state.storage.deleteAll();
     }
   }
 }

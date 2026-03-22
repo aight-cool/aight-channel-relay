@@ -35,25 +35,6 @@ function jsonResponse(data: unknown, status = 200): Response {
   });
 }
 
-/**
- * Map pairing codes → Durable Object IDs.
- *
- * We use a separate DO instance keyed by "codes" that acts as an in-memory
- * registry. But that's heavy — instead we derive the DO ID deterministically
- * from a session ID and keep a lightweight in-memory code→sessionId map in
- * the worker. Since workers are ephemeral, we actually store the mapping
- * as part of the DO itself and do a two-step lookup.
- *
- * Simpler approach: the plugin gets back a sessionId from /pair.
- * The app sends the pairing code. We need to map code → DO.
- *
- * Strategy: Use a "lookup" DO keyed by "pairing-codes" to store
- * the code → sessionId mapping. Lightweight and auto-cleans.
- */
-
-// We'll use a simple approach: derive DO name from sessionId for sessions,
-// and use a global "pairing-registry" DO for code lookups.
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -106,11 +87,9 @@ export default {
 async function handlePair(env: Env): Promise<Response> {
   const sessionId = generateSessionId();
 
-  // Create a DO instance for this session
   const doId = env.CHANNEL_ROOM.idFromName(sessionId);
   const stub = env.CHANNEL_ROOM.get(doId);
 
-  // Initialize the session in the DO
   const doResponse = await stub.fetch(
     new Request("https://do/init", {
       method: "POST",
@@ -136,27 +115,24 @@ async function handlePair(env: Env): Promise<Response> {
 }
 
 // ── Plugin WebSocket handler ──
+// Forward the original request (preserving Upgrade headers) to the session DO.
 
 async function handlePluginWebSocket(
   request: Request,
   env: Env,
   sessionToken: string,
 ): Promise<Response> {
-  // The session token encodes the session — we need to find which session.
-  // The plugin must also pass sessionId so we can look up the DO.
   const url = new URL(request.url);
   const sessionId = url.searchParams.get("id");
   if (!sessionId) {
     return jsonResponse({ error: "Missing id parameter" }, 400);
   }
 
-  // Validate token
   const valid = await validateSessionToken(env.RELAY_SECRET, sessionId, sessionToken);
   if (!valid) {
     return jsonResponse({ error: "Invalid session token" }, 403);
   }
 
-  // Forward to the DO
   const doId = env.CHANNEL_ROOM.idFromName(sessionId);
   const stub = env.CHANNEL_ROOM.get(doId);
 
@@ -164,18 +140,17 @@ async function handlePluginWebSocket(
   doUrl.searchParams.set("role", "plugin");
   doUrl.searchParams.set("token", sessionToken);
 
-  return stub.fetch(
-    new Request(doUrl.toString(), {
-      method: "GET",
-      headers: request.headers,
-    }),
-  );
+  // Pass original request to preserve WebSocket upgrade headers
+  return stub.fetch(new Request(doUrl.toString(), request));
 }
 
 // ── App WebSocket (pairing) handler ──
 
-async function handleAppPairWebSocket(request: Request, env: Env, code: string): Promise<Response> {
-  // Look up the session ID from the pairing registry
+async function handleAppPairWebSocket(
+  request: Request,
+  env: Env,
+  code: string,
+): Promise<Response> {
   const registryId = env.CHANNEL_ROOM.idFromName("__pairing_registry__");
   const registry = env.CHANNEL_ROOM.get(registryId);
 
@@ -186,7 +161,6 @@ async function handleAppPairWebSocket(request: Request, env: Env, code: string):
 
   const { sessionId } = await lookupResp.json<{ sessionId: string }>();
 
-  // Forward to the session DO
   const doId = env.CHANNEL_ROOM.idFromName(sessionId);
   const stub = env.CHANNEL_ROOM.get(doId);
 
@@ -194,12 +168,8 @@ async function handleAppPairWebSocket(request: Request, env: Env, code: string):
   doUrl.searchParams.set("role", "app");
   doUrl.searchParams.set("code", code);
 
-  return stub.fetch(
-    new Request(doUrl.toString(), {
-      method: "GET",
-      headers: request.headers,
-    }),
-  );
+  // Pass original request to preserve WebSocket upgrade headers
+  return stub.fetch(new Request(doUrl.toString(), request));
 }
 
 // ── App WebSocket (reconnect) handler ──
@@ -215,7 +185,6 @@ async function handleAppReconnectWebSocket(
     return jsonResponse({ error: "Missing id parameter" }, 400);
   }
 
-  // Forward to the DO — it will validate the app's token
   const doId = env.CHANNEL_ROOM.idFromName(sessionId);
   const stub = env.CHANNEL_ROOM.get(doId);
 
@@ -223,10 +192,6 @@ async function handleAppReconnectWebSocket(
   doUrl.searchParams.set("role", "app");
   doUrl.searchParams.set("token", sessionToken);
 
-  return stub.fetch(
-    new Request(doUrl.toString(), {
-      method: "GET",
-      headers: request.headers,
-    }),
-  );
+  // Pass original request to preserve WebSocket upgrade headers
+  return stub.fetch(new Request(doUrl.toString(), request));
 }
