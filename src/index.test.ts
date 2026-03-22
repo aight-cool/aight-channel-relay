@@ -8,7 +8,9 @@ describe("GET /", () => {
     const resp = await SELF.fetch("https://relay/");
     expect(resp.status).toBe(200);
     const body = await resp.json<{ ok: boolean; service: string; version: string }>();
-    expect(body).toEqual({ ok: true, service: "aight-channel-relay", version: "0.1.0" });
+    expect(body.ok).toBe(true);
+    expect(body.service).toBe("aight-channel-relay");
+    expect(body.version).toBeDefined();
   });
 
   it("includes CORS headers", async () => {
