@@ -291,8 +291,9 @@ describe("Message Buffering", () => {
     await sleep(50);
 
     plugin.ws.send('{"content":"buffered-1"}');
+    await sleep(10);
     plugin.ws.send('{"content":"buffered-2"}');
-    await sleep(20);
+    await sleep(100);
 
     const app2 = await connectWs(stub, `https://do/ws?role=app&token=${appToken}`);
 
@@ -413,7 +414,7 @@ describe("Full Lifecycle", () => {
 
     // 5. Plugin sends while app is offline — buffered
     plugin.ws.send('{"content":"offline msg"}');
-    await sleep(20);
+    await sleep(100);
 
     // 6. App reconnects — gets buffered messages
     const app2 = await connectWs(stub, `https://do/ws?role=app&token=${appToken}`);
