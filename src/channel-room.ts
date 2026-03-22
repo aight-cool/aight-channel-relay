@@ -203,6 +203,15 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       });
     }
 
+    // Debug: minimal WebSocket test — no auth, no session, just upgrade
+    if (url.pathname === "/ws-test") {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      this.ctx.acceptWebSocket(server);
+      server.send(JSON.stringify({ type: "test", msg: "hello" }));
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
     return Response.json({ error: "Not found" }, { status: 404 });
   }
 
