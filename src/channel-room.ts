@@ -268,11 +268,13 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     this.ctx.acceptWebSocket(server, ["app"]);
     this.appWs = server;
 
-    // Send pairing confirmation with app's session token
+    // Send pairing confirmation with app's session token and session ID
+    // (session ID needed for reconnection — the outer worker uses it to find this DO)
     server.send(
       JSON.stringify({
         type: "paired",
         sessionToken: appToken,
+        sessionId: this.session.pluginSessionId,
         timestamp: new Date().toISOString(),
       }),
     );
