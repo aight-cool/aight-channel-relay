@@ -28,13 +28,13 @@ Pairs an **Aight Channel Plugin** (running on a user's laptop) with the **Aight 
 
 ## Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/` | Health check |
-| `POST` | `/pair` | Plugin requests a pairing code → `{ code, sessionToken, sessionId }` |
-| `GET` | `/ws/plugin?session=<token>&id=<sessionId>` | Plugin WebSocket |
-| `GET` | `/ws/app?code=<code>` | App WebSocket (first-time pairing) |
-| `GET` | `/ws/app?session=<token>&id=<sessionId>` | App WebSocket (reconnect) |
+| Method | Path                                        | Description                                                          |
+| ------ | ------------------------------------------- | -------------------------------------------------------------------- |
+| `GET`  | `/`                                         | Health check                                                         |
+| `POST` | `/pair`                                     | Plugin requests a pairing code → `{ code, sessionToken, sessionId }` |
+| `GET`  | `/ws/plugin?session=<token>&id=<sessionId>` | Plugin WebSocket                                                     |
+| `GET`  | `/ws/app?code=<code>`                       | App WebSocket (first-time pairing)                                   |
+| `GET`  | `/ws/app?session=<token>&id=<sessionId>`    | App WebSocket (reconnect)                                            |
 
 ## Pairing Flow
 
@@ -48,14 +48,14 @@ Pairs an **Aight Channel Plugin** (running on a user's laptop) with the **Aight 
 
 ## Message Protocol
 
-| Direction | Type | Payload |
-|-----------|------|---------|
-| Plugin → App | `reply` | `{ type: "reply", id, content, timestamp }` |
-| App → Plugin | `message` | `{ type: "message", content, id, sender: { name, device } }` |
-| Both | `ping` / `pong` | `{ type: "ping" }` / `{ type: "pong" }` |
-| Relay → Both | `paired` | `{ type: "paired", sessionToken? }` |
-| Relay → Both | `partner_connected` | `{ type: "partner_connected" }` |
-| Relay → Both | `partner_disconnected` | `{ type: "partner_disconnected" }` |
+| Direction    | Type                   | Payload                                                      |
+| ------------ | ---------------------- | ------------------------------------------------------------ |
+| Plugin → App | `reply`                | `{ type: "reply", id, content, timestamp }`                  |
+| App → Plugin | `message`              | `{ type: "message", content, id, sender: { name, device } }` |
+| Both         | `ping` / `pong`        | `{ type: "ping" }` / `{ type: "pong" }`                      |
+| Relay → Both | `paired`               | `{ type: "paired", sessionToken? }`                          |
+| Relay → Both | `partner_connected`    | `{ type: "partner_connected" }`                              |
+| Relay → Both | `partner_disconnected` | `{ type: "partner_disconnected" }`                           |
 
 ## Development
 

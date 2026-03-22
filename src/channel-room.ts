@@ -48,14 +48,18 @@ interface BufferedMessage {
 
 type WebSocketRole = "plugin" | "app";
 
-interface WebSocketAttachment {
-  role: WebSocketRole;
-  sessionId: string;
-}
-
 const PAIRING_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const MESSAGE_BUFFER_SIZE = 10;
 const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+/** Send a JSON message to a WebSocket, silently ignoring errors (e.g. disconnected). */
+function trySendJson(ws: WebSocket, payload: Record<string, unknown>): void {
+  try {
+    ws.send(JSON.stringify(payload));
+  } catch {
+    // Peer already disconnected
+  }
+}
 
 export class ChannelRoom implements DurableObject {
   private state: DurableObjectState;
@@ -197,15 +201,8 @@ export class ChannelRoom implements DurableObject {
       }),
     );
 
-    // Notify app that plugin reconnected
     if (this.session.paired && this.appWs) {
-      try {
-        this.appWs.send(
-          JSON.stringify({ type: "partner_connected", timestamp: new Date().toISOString() }),
-        );
-      } catch {
-        // App disconnected
-      }
+      trySendJson(this.appWs, { type: "partner_connected", timestamp: new Date().toISOString() });
     }
 
     // Deliver buffered messages sent while plugin was disconnected
@@ -257,15 +254,8 @@ export class ChannelRoom implements DurableObject {
       }),
     );
 
-    // Notify plugin that app paired
     if (this.pluginWs) {
-      try {
-        this.pluginWs.send(
-          JSON.stringify({ type: "paired", timestamp: new Date().toISOString() }),
-        );
-      } catch {
-        // Plugin disconnected
-      }
+      trySendJson(this.pluginWs, { type: "paired", timestamp: new Date().toISOString() });
     }
 
     return new Response(null, { status: 101, webSocket: client });
@@ -303,15 +293,11 @@ export class ChannelRoom implements DurableObject {
       }),
     );
 
-    // Notify plugin that app reconnected
     if (this.pluginWs) {
-      try {
-        this.pluginWs.send(
-          JSON.stringify({ type: "partner_connected", timestamp: new Date().toISOString() }),
-        );
-      } catch {
-        // Plugin disconnected
-      }
+      trySendJson(this.pluginWs, {
+        type: "partner_connected",
+        timestamp: new Date().toISOString(),
+      });
     }
 
     // Deliver buffered messages sent while app was disconnected
@@ -325,14 +311,16 @@ export class ChannelRoom implements DurableObject {
    */
   private deliverBufferedMessages(ws: WebSocket, fromRole: WebSocketRole): void {
     if (!this.session) return;
-    const messages = this.session.messageBuffer.filter((m) => m.from === fromRole);
-    for (const msg of messages) {
+    const toDeliver = this.session.messageBuffer.filter((m) => m.from === fromRole);
+    for (const msg of toDeliver) {
       try {
         ws.send(msg.data);
       } catch {
         break;
       }
     }
+    // Remove delivered messages from buffer
+    this.session.messageBuffer = this.session.messageBuffer.filter((m) => m.from !== fromRole);
   }
 
   /**
@@ -390,42 +378,34 @@ export class ChannelRoom implements DurableObject {
   /**
    * WebSocket close handler.
    */
-  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {
+  async webSocketClose(
+    ws: WebSocket,
+    _code: number,
+    _reason: string,
+    _wasClean: boolean,
+  ): Promise<void> {
     const tags = this.state.getTags(ws);
     const role = tags.includes("plugin") ? "plugin" : "app";
+    const partner = role === "plugin" ? this.appWs : this.pluginWs;
 
     if (role === "plugin") {
       this.pluginWs = null;
-      // Notify app
-      if (this.appWs) {
-        try {
-          this.appWs.send(
-            JSON.stringify({ type: "partner_disconnected", timestamp: new Date().toISOString() }),
-          );
-        } catch {
-          // App also disconnected
-        }
-      }
     } else {
       this.appWs = null;
-      // Notify plugin
-      if (this.pluginWs) {
-        try {
-          this.pluginWs.send(
-            JSON.stringify({ type: "partner_disconnected", timestamp: new Date().toISOString() }),
-          );
-        } catch {
-          // Plugin also disconnected
-        }
-      }
+    }
+
+    if (partner) {
+      trySendJson(partner, {
+        type: "partner_disconnected",
+        timestamp: new Date().toISOString(),
+      });
     }
   }
 
   /**
    * WebSocket error handler.
    */
-  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
-    // Treat errors as disconnections
+  async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     await this.webSocketClose(ws, 1006, "error", false);
   }
 

@@ -12,7 +12,7 @@
  *   GET  /ws/app?session=<tok>    — App WebSocket reconnection
  */
 
-import { generateSessionId, generateSessionToken, validateSessionToken } from "./auth";
+import { generateSessionId, validateSessionToken } from "./auth";
 
 export { ChannelRoom } from "./channel-room";
 
@@ -111,22 +111,26 @@ async function handlePair(env: Env): Promise<Response> {
   const stub = env.CHANNEL_ROOM.get(doId);
 
   // Initialize the session in the DO
-  const doResponse = await stub.fetch(new Request("https://do/init", {
-    method: "POST",
-    body: JSON.stringify({ pluginSessionId: sessionId }),
-    headers: { "Content-Type": "application/json" },
-  }));
+  const doResponse = await stub.fetch(
+    new Request("https://do/init", {
+      method: "POST",
+      body: JSON.stringify({ pluginSessionId: sessionId }),
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
 
   const { code, sessionToken } = await doResponse.json<{ code: string; sessionToken: string }>();
 
   // Store code → sessionId mapping in the pairing registry DO
   const registryId = env.CHANNEL_ROOM.idFromName("__pairing_registry__");
   const registry = env.CHANNEL_ROOM.get(registryId);
-  await registry.fetch(new Request("https://do/register-code", {
-    method: "POST",
-    body: JSON.stringify({ code, sessionId }),
-    headers: { "Content-Type": "application/json" },
-  }));
+  await registry.fetch(
+    new Request("https://do/register-code", {
+      method: "POST",
+      body: JSON.stringify({ code, sessionId }),
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
 
   return jsonResponse({ code, sessionToken, sessionId });
 }
@@ -160,19 +164,17 @@ async function handlePluginWebSocket(
   doUrl.searchParams.set("role", "plugin");
   doUrl.searchParams.set("token", sessionToken);
 
-  return stub.fetch(new Request(doUrl.toString(), {
-    method: "GET",
-    headers: request.headers,
-  }));
+  return stub.fetch(
+    new Request(doUrl.toString(), {
+      method: "GET",
+      headers: request.headers,
+    }),
+  );
 }
 
 // ── App WebSocket (pairing) handler ──
 
-async function handleAppPairWebSocket(
-  request: Request,
-  env: Env,
-  code: string,
-): Promise<Response> {
+async function handleAppPairWebSocket(request: Request, env: Env, code: string): Promise<Response> {
   // Look up the session ID from the pairing registry
   const registryId = env.CHANNEL_ROOM.idFromName("__pairing_registry__");
   const registry = env.CHANNEL_ROOM.get(registryId);
@@ -192,10 +194,12 @@ async function handleAppPairWebSocket(
   doUrl.searchParams.set("role", "app");
   doUrl.searchParams.set("code", code);
 
-  return stub.fetch(new Request(doUrl.toString(), {
-    method: "GET",
-    headers: request.headers,
-  }));
+  return stub.fetch(
+    new Request(doUrl.toString(), {
+      method: "GET",
+      headers: request.headers,
+    }),
+  );
 }
 
 // ── App WebSocket (reconnect) handler ──
@@ -219,8 +223,10 @@ async function handleAppReconnectWebSocket(
   doUrl.searchParams.set("role", "app");
   doUrl.searchParams.set("token", sessionToken);
 
-  return stub.fetch(new Request(doUrl.toString(), {
-    method: "GET",
-    headers: request.headers,
-  }));
+  return stub.fetch(
+    new Request(doUrl.toString(), {
+      method: "GET",
+      headers: request.headers,
+    }),
+  );
 }
