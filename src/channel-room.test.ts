@@ -308,10 +308,13 @@ describe("Message Buffering", () => {
     app.ws.close();
     await sleep(50);
 
+    // Send 15 messages — each triggers an async storage write in bufferMessage,
+    // so we need enough time for all 15 to be processed sequentially by the DO.
     for (let i = 0; i < 15; i++) {
       plugin.ws.send(`{"content":"msg-${i}"}`);
+      await sleep(10); // space out sends to avoid overwhelming the DO
     }
-    await sleep(100);
+    await sleep(200);
 
     const app2 = await connectWs(stub, `https://do/ws?role=app&token=${appToken}`);
 
