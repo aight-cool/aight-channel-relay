@@ -69,6 +69,18 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
   constructor(ctx: DurableObjectState, env: { RELAY_SECRET: string }) {
     super(ctx, env);
+
+    // Restore WebSocket references after hibernation.
+    // The runtime keeps the connections alive but our in-memory
+    // references (pluginWs, appWs) are lost when the DO is evicted.
+    for (const ws of this.ctx.getWebSockets()) {
+      const tags = this.ctx.getTags(ws);
+      if (tags.includes("plugin")) {
+        this.pluginWs = ws;
+      } else if (tags.includes("app")) {
+        this.appWs = ws;
+      }
+    }
   }
 
   /** Lazy-load session from storage on first access */
