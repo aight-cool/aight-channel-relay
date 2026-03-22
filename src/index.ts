@@ -146,11 +146,7 @@ async function handlePluginWebSocket(
 
 // ── App WebSocket (pairing) handler ──
 
-async function handleAppPairWebSocket(
-  request: Request,
-  env: Env,
-  code: string,
-): Promise<Response> {
+async function handleAppPairWebSocket(request: Request, env: Env, code: string): Promise<Response> {
   const registryId = env.CHANNEL_ROOM.idFromName("__pairing_registry__");
   const registry = env.CHANNEL_ROOM.get(registryId);
 
