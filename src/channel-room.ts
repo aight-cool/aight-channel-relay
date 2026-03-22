@@ -129,7 +129,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
   async fetch(request: Request): Promise<Response> {
     try {
       const url = new URL(request.url);
-      console.log(
+      console.error(
         `[ChannelRoom] fetch: ${request.method} ${url.pathname}${url.search} | upgrade=${request.headers.get("upgrade")} | session=${!!this.session}`,
       );
       return await this._fetch(request);
@@ -206,24 +206,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       }
 
       return Response.json({ error: "Invalid parameters" }, { status: 400 });
-    }
-
-    // Debug: version check
-    if (url.pathname === "/version") {
-      return Response.json({
-        version: "0.1.1",
-        hasSession: !!this.session,
-        className: this.constructor.name,
-      });
-    }
-
-    // Debug: minimal WebSocket test — no auth, no session, just upgrade
-    if (url.pathname === "/ws-test") {
-      const pair = new WebSocketPair();
-      const [client, server] = Object.values(pair);
-      this.ctx.acceptWebSocket(server);
-      server.send(JSON.stringify({ type: "test", msg: "hello" }));
-      return new Response(null, { status: 101, webSocket: client });
     }
 
     return Response.json({ error: "Not found" }, { status: 404 });

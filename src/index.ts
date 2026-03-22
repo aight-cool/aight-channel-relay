@@ -48,7 +48,7 @@ export default {
       return jsonResponse({
         ok: true,
         service: "aight-channel-relay",
-        version: "0.1.1-ws-fix",
+        version: "0.2.0",
       });
     }
 
@@ -115,13 +115,6 @@ export default {
       }
 
       return jsonResponse({ error: "Missing code or session parameter" }, 400);
-    }
-
-    // Debug: minimal WebSocket test route
-    if (url.pathname === "/ws-test" && request.method === "GET") {
-      const doId = env.CHANNEL_ROOM.idFromName("ws-test");
-      const stub = env.CHANNEL_ROOM.get(doId);
-      return stub.fetch(request);
     }
 
     return jsonResponse({ error: "Not found" }, 404);
