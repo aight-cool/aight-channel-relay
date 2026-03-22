@@ -12,6 +12,7 @@
  *   5. Auto-cleanup when both sides disconnect
  */
 
+import { DurableObject } from "cloudflare:workers";
 import { generateSessionToken, generatePairingCode, validateSessionToken } from "./auth";
 
 /**
@@ -61,20 +62,17 @@ function trySendJson(ws: WebSocket, payload: Record<string, unknown>): void {
   }
 }
 
-export class ChannelRoom implements DurableObject {
-  private state: DurableObjectState;
-  private env: { RELAY_SECRET: string };
+export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
   private session: SessionState | null = null;
   private pluginWs: WebSocket | null = null;
   private appWs: WebSocket | null = null;
 
-  constructor(state: DurableObjectState, env: { RELAY_SECRET: string }) {
-    this.state = state;
-    this.env = env;
+  constructor(ctx: DurableObjectState, env: { RELAY_SECRET: string }) {
+    super(ctx, env);
 
     // Restore session from storage if DO was evicted and re-instantiated
-    this.state.blockConcurrencyWhile(async () => {
-      const saved = await this.state.storage.get<SessionState>("session");
+    this.ctx.blockConcurrencyWhile(async () => {
+      const saved = await this.ctx.storage.get<SessionState>("session");
       if (saved) {
         this.session = saved;
       }
@@ -106,8 +104,8 @@ export class ChannelRoom implements DurableObject {
     };
 
     // Persist and schedule cleanup
-    await this.state.storage.put("session", this.session);
-    await this.state.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
+    await this.ctx.storage.put("session", this.session);
+    await this.ctx.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
 
     return { code, sessionToken };
   }
@@ -117,10 +115,15 @@ export class ChannelRoom implements DurableObject {
    */
   async fetch(request: Request): Promise<Response> {
     try {
+      const url = new URL(request.url);
+      console.log(
+        `[ChannelRoom] fetch: ${request.method} ${url.pathname}${url.search} | upgrade=${request.headers.get("upgrade")} | session=${!!this.session}`,
+      );
       return await this._fetch(request);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[ChannelRoom] Error: ${msg}`);
+      const stack = err instanceof Error ? err.stack : "";
+      console.error(`[ChannelRoom] Error: ${msg}\n${stack}`);
       return Response.json({ error: msg }, { status: 500 });
     }
   }
@@ -133,7 +136,7 @@ export class ChannelRoom implements DurableObject {
     if (url.pathname === "/register-code" && request.method === "POST") {
       const { code, sessionId } = await request.json<{ code: string; sessionId: string }>();
       // Persist to DO storage so it survives eviction
-      await this.state.storage.put(`code:${code}`, {
+      await this.ctx.storage.put(`code:${code}`, {
         sessionId,
         expiresAt: Date.now() + PAIRING_CODE_TTL_MS,
       } satisfies CodeEntry);
@@ -144,15 +147,15 @@ export class ChannelRoom implements DurableObject {
       const code = url.searchParams.get("code");
       if (!code) return Response.json({ error: "Missing code" }, { status: 400 });
 
-      const entry = await this.state.storage.get<CodeEntry>(`code:${code}`);
+      const entry = await this.ctx.storage.get<CodeEntry>(`code:${code}`);
       if (!entry) return Response.json({ error: "Unknown code" }, { status: 404 });
       if (Date.now() > entry.expiresAt) {
-        await this.state.storage.delete(`code:${code}`);
+        await this.ctx.storage.delete(`code:${code}`);
         return Response.json({ error: "Code expired" }, { status: 410 });
       }
 
       // Delete code after successful lookup (one-time use)
-      await this.state.storage.delete(`code:${code}`);
+      await this.ctx.storage.delete(`code:${code}`);
       return Response.json({ sessionId: entry.sessionId });
     }
 
@@ -207,7 +210,7 @@ export class ChannelRoom implements DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    this.state.acceptWebSocket(server, ["plugin"]);
+    this.ctx.acceptWebSocket(server, ["plugin"]);
     this.pluginWs = server;
 
     // Notify plugin of current state
@@ -257,12 +260,12 @@ export class ChannelRoom implements DurableObject {
     this.session.lastActivity = Date.now();
 
     // Persist updated session
-    await this.state.storage.put("session", this.session);
+    await this.ctx.storage.put("session", this.session);
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    this.state.acceptWebSocket(server, ["app"]);
+    this.ctx.acceptWebSocket(server, ["app"]);
     this.appWs = server;
 
     // Send pairing confirmation with app's session token
@@ -301,7 +304,7 @@ export class ChannelRoom implements DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    this.state.acceptWebSocket(server, ["app"]);
+    this.ctx.acceptWebSocket(server, ["app"]);
     this.appWs = server;
 
     // Send reconnection confirmation
@@ -352,7 +355,7 @@ export class ChannelRoom implements DurableObject {
     if (this.session.messageBuffer.length > MESSAGE_BUFFER_SIZE) {
       this.session.messageBuffer.shift();
     }
-    await this.state.storage.put("session", this.session);
+    await this.ctx.storage.put("session", this.session);
   }
 
   /**
@@ -362,13 +365,13 @@ export class ChannelRoom implements DurableObject {
     if (!this.session) return;
 
     const data = typeof message === "string" ? message : new TextDecoder().decode(message);
-    const tags = this.state.getTags(ws);
+    const tags = this.ctx.getTags(ws);
     const role = tags.includes("plugin") ? "plugin" : "app";
 
     this.session.lastActivity = Date.now();
 
     // Reset inactivity alarm
-    await this.state.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
+    await this.ctx.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
 
     // Parse for ping/pong handling
     try {
@@ -405,7 +408,7 @@ export class ChannelRoom implements DurableObject {
     _reason: string,
     _wasClean: boolean,
   ): Promise<void> {
-    const tags = this.state.getTags(ws);
+    const tags = this.ctx.getTags(ws);
     const role = tags.includes("plugin") ? "plugin" : "app";
     const partner = role === "plugin" ? this.appWs : this.pluginWs;
 
@@ -454,7 +457,7 @@ export class ChannelRoom implements DurableObject {
         }
       }
       this.session = null;
-      await this.state.storage.deleteAll();
+      await this.ctx.storage.deleteAll();
     }
   }
 }
