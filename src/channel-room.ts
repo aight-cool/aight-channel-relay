@@ -82,9 +82,9 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     // references (pluginWs, appWs) are lost when the DO is evicted.
     for (const ws of this.ctx.getWebSockets()) {
       const tags = this.ctx.getTags(ws);
-      if (tags.includes("plugin")) {
+      if (tags.includes("plugin") || tags.includes("pending-plugin")) {
         this.pluginWs = ws;
-      } else if (tags.includes("app")) {
+      } else if (tags.includes("app") || tags.includes("pending-app")) {
         this.appWs = ws;
       }
     }
@@ -613,30 +613,26 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
     const tags = this.ctx.getTags(ws);
 
-    // ── Handle pending (unauthenticated) connections ──
-    if (tags.includes("pending-plugin") || tags.includes("pending-app")) {
-      await this.handleAuthMessage(ws, tags, data);
-      return;
-    }
-
-    if (!this.session) return;
-
-    // Determine role — check tags first, then fall back to WS reference
-    // (pending-* tagged connections get promoted via handleAuthMessage
-    // but tags can't be changed in the Hibernation API)
-    let role: WebSocketRole;
-    if (tags.includes("plugin")) {
-      role = "plugin";
-    } else if (tags.includes("app")) {
-      role = "app";
-    } else if (ws === this.pluginWs) {
+    // Determine role — check WS refs first (handles pending-* after auth/hibernation),
+    // then tags, then treat as pending if truly unauthenticated
+    let role: WebSocketRole | null = null;
+    if (ws === this.pluginWs) {
       role = "plugin";
     } else if (ws === this.appWs) {
       role = "app";
-    } else {
-      // Unknown WS — shouldn't happen, but don't crash
+    } else if (tags.includes("plugin")) {
+      role = "plugin";
+    } else if (tags.includes("app")) {
+      role = "app";
+    } else if (tags.includes("pending-plugin") || tags.includes("pending-app")) {
+      // Truly unauthenticated — handle auth message
+      await this.handleAuthMessage(ws, tags, data);
       return;
+    } else {
+      return; // Unknown WS
     }
+
+    if (!this.session) return;
 
     this.session.lastActivity = Date.now();
 
@@ -679,12 +675,12 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     _wasClean: boolean,
   ): Promise<void> {
     const tags = this.ctx.getTags(ws);
-    // Determine role (same logic as webSocketMessage — tags or WS ref)
+    // Determine role — WS refs first (handles pending-* after auth/hibernation)
     let role: WebSocketRole;
-    if (tags.includes("plugin")) role = "plugin";
-    else if (tags.includes("app")) role = "app";
-    else if (ws === this.pluginWs) role = "plugin";
+    if (ws === this.pluginWs) role = "plugin";
     else if (ws === this.appWs) role = "app";
+    else if (tags.includes("plugin") || tags.includes("pending-plugin")) role = "plugin";
+    else if (tags.includes("app") || tags.includes("pending-app")) role = "app";
     else return; // Pending connection that never authenticated — just drop it
     const partner = role === "plugin" ? this.appWs : this.pluginWs;
 
