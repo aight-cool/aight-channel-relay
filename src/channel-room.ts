@@ -181,6 +181,34 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
     // ── Session endpoints ──
 
+    // POST /revoke — kill this session, close all connections
+    if (url.pathname === "/revoke" && request.method === "POST") {
+      // Close all WebSockets
+      if (this.pluginWs) {
+        try {
+          this.pluginWs.close(1000, "Session revoked");
+        } catch {
+          /* already closed */
+        }
+        this.pluginWs = null;
+      }
+      if (this.appWs) {
+        try {
+          this.appWs.close(1000, "Session revoked");
+        } catch {
+          /* already closed */
+        }
+        this.appWs = null;
+      }
+
+      // Clear all state
+      this.session = null;
+      this.volatileBuffer = [];
+      await this.ctx.storage.deleteAll();
+
+      return Response.json({ ok: true, message: "Session revoked" });
+    }
+
     // POST /init — initialize session (called internally by worker)
     if (url.pathname === "/init" && request.method === "POST") {
       const { pluginSessionId } = await request.json<{ pluginSessionId: string }>();

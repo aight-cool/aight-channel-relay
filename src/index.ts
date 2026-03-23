@@ -83,6 +83,36 @@ export default {
     // Client IP for rate limiting
     const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
 
+    // ── POST /revoke — Kill a session (M4: session revocation) ──
+    if (url.pathname === "/revoke" && request.method === "POST") {
+      try {
+        const body = await request.json<{
+          sessionToken: string;
+          sessionId: string;
+        }>();
+        if (!body.sessionToken || !body.sessionId) {
+          return jsonResponse({ error: "Missing sessionToken or sessionId" }, 400);
+        }
+
+        const valid = await validateSessionToken(
+          env.RELAY_SECRET,
+          body.sessionId,
+          body.sessionToken,
+        );
+        if (!valid) {
+          return jsonResponse({ error: "Invalid credentials" }, 403);
+        }
+
+        // Forward revoke to the DO
+        const doId = env.CHANNEL_ROOM.idFromName(body.sessionId);
+        const stub = env.CHANNEL_ROOM.get(doId);
+        const doResp = await stub.fetch(new Request("https://do/revoke", { method: "POST" }));
+        return jsonResponse(await doResp.json());
+      } catch {
+        return jsonResponse({ error: "Invalid request body" }, 400);
+      }
+    }
+
     // ── POST /pair — Plugin requests a new pairing session ──
     if (url.pathname === "/pair" && request.method === "POST") {
       // Rate limit: 3 per 10 min per IP (prevents DO creation spam / denial-of-wallet)
