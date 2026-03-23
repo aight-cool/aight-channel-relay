@@ -101,24 +101,26 @@ export default {
     if (url.pathname === "/ws/plugin" && request.method === "GET") {
       const sessionToken = url.searchParams.get("session");
       const sessionId = url.searchParams.get("id");
-      if (!sessionToken || !sessionId) {
-        return jsonResponse({ error: "Missing session or id parameter" }, 400);
+
+      if (sessionToken && sessionId) {
+        // Legacy: token in URL (backwards compat)
+        const valid = await validateSessionToken(env.RELAY_SECRET, sessionId, sessionToken);
+        if (!valid) {
+          return jsonResponse({ error: "Invalid session token" }, 403);
+        }
+        const doId = env.CHANNEL_ROOM.idFromName(sessionId);
+        const stub = env.CHANNEL_ROOM.get(doId);
+        return stub.fetch(request);
       }
 
-      const valid = await validateSessionToken(env.RELAY_SECRET, sessionId, sessionToken);
-      if (!valid) {
-        return jsonResponse({ error: "Invalid session token" }, 403);
+      if (sessionId) {
+        // New: token-free URL — auth happens over WS as first message
+        const doId = env.CHANNEL_ROOM.idFromName(sessionId);
+        const stub = env.CHANNEL_ROOM.get(doId);
+        return stub.fetch(request);
       }
 
-      const doId = env.CHANNEL_ROOM.idFromName(sessionId);
-      const stub = env.CHANNEL_ROOM.get(doId);
-
-      // Use two-arg form: stub.fetch(url, request) — passes the original
-      // request as RequestInit, which preserves CF's WebSocket metadata.
-      // Pattern from CF's own chat demo: roomObject.fetch(newUrl, request)
-      const doUrl = new URL(request.url);
-      doUrl.pathname = "/ws/plugin";
-      return stub.fetch(doUrl.toString(), request);
+      return jsonResponse({ error: "Missing id parameter" }, 400);
     }
 
     // ── GET /ws/app — App WebSocket (pairing or reconnect) ──
@@ -153,7 +155,7 @@ export default {
       }
 
       if (sessionToken) {
-        // Reconnect
+        // Legacy reconnect: token in URL
         const sessionId = url.searchParams.get("id");
         if (!sessionId) {
           return jsonResponse({ error: "Missing id parameter" }, 400);
@@ -161,10 +163,18 @@ export default {
 
         const doId = env.CHANNEL_ROOM.idFromName(sessionId);
         const stub = env.CHANNEL_ROOM.get(doId);
-        return stub.fetch(url.toString(), request);
+        return stub.fetch(request);
       }
 
-      return jsonResponse({ error: "Missing code or session parameter" }, 400);
+      // New: token-free URL — just session ID, auth via first WS message
+      const sessionId = url.searchParams.get("id");
+      if (sessionId) {
+        const doId = env.CHANNEL_ROOM.idFromName(sessionId);
+        const stub = env.CHANNEL_ROOM.get(doId);
+        return stub.fetch(request);
+      }
+
+      return jsonResponse({ error: "Missing code, session, or id parameter" }, 400);
     }
 
     return jsonResponse({ error: "Not found" }, 404);
