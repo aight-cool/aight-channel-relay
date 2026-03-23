@@ -201,6 +201,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       const token = url.searchParams.get("session") ?? url.searchParams.get("token");
       const code = url.searchParams.get("code");
 
+      // Legacy: token/code in URL (still supported for backwards compat)
       if (role === "plugin" && token) {
         return this.handlePluginConnect(token);
       }
@@ -209,6 +210,12 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       }
       if (role === "app" && token) {
         return this.handleAppReconnect(token);
+      }
+
+      // New: no token in URL — accept connection, authenticate on first message.
+      // Tag as "pending-<role>" until authenticated.
+      if (role === "plugin" || role === "app") {
+        return this.handlePendingConnect(role);
       }
 
       return Response.json({ error: "Invalid parameters" }, { status: 400 });
@@ -359,6 +366,181 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
   }
 
   /**
+   * Accept a WebSocket connection without authentication.
+   * The client must send { type: "auth", token: "...", id?: "..." } or
+   * { type: "auth", code: "..." } as the first message.
+   * Tagged as "pending" until authenticated.
+   */
+  private handlePendingConnect(role: WebSocketRole): Response {
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+
+    // Tag as pending — will be re-tagged after auth
+    this.ctx.acceptWebSocket(server, [`pending-${role}`]);
+
+    // Send a prompt to authenticate
+    server.send(
+      JSON.stringify({
+        type: "auth_required",
+        timestamp: new Date().toISOString(),
+      }),
+    );
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /**
+   * Handle the first message from a pending (unauthenticated) connection.
+   * Expects: { type: "auth", token: "...", id?: "..." } or { type: "auth", code: "..." }
+   */
+  private async handleAuthMessage(ws: WebSocket, tags: string[], data: string): Promise<void> {
+    let parsed: { type?: string; token?: string; code?: string; id?: string };
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      trySendJson(ws, { type: "error", message: "Invalid JSON" });
+      ws.close(4000, "Invalid auth message");
+      return;
+    }
+
+    if (parsed.type !== "auth") {
+      trySendJson(ws, {
+        type: "error",
+        message: "First message must be { type: 'auth', ... }",
+      });
+      ws.close(4001, "Auth required");
+      return;
+    }
+
+    const isPendingPlugin = tags.includes("pending-plugin");
+
+    if (isPendingPlugin && parsed.token) {
+      // Plugin auth with token
+      if (!this.session) {
+        trySendJson(ws, { type: "error", message: "Session not found" });
+        ws.close(4002, "No session");
+        return;
+      }
+      const valid = await validateSessionToken(
+        this.env.RELAY_SECRET,
+        this.session.pluginSessionId,
+        parsed.token,
+      );
+      if (!valid) {
+        trySendJson(ws, { type: "error", message: "Invalid token" });
+        ws.close(4003, "Auth failed");
+        return;
+      }
+
+      // Authenticated — promote to full plugin connection
+      // Note: Hibernation API doesn't support changing tags, so we track via the WS ref
+      this.pluginWs = ws;
+
+      trySendJson(ws, {
+        type: this.session.paired ? "partner_connected" : "waiting_for_pair",
+        timestamp: new Date().toISOString(),
+      });
+
+      if (this.session.paired && this.appWs) {
+        trySendJson(this.appWs, {
+          type: "partner_connected",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      this.deliverBufferedMessages(ws, "app");
+      return;
+    }
+
+    if (!isPendingPlugin && parsed.code) {
+      // App auth with pairing code
+      if (!this.session) {
+        trySendJson(ws, { type: "error", message: "Session not found" });
+        ws.close(4002, "No session");
+        return;
+      }
+      if (!this.session.pairingCode || this.session.pairingCode !== parsed.code) {
+        trySendJson(ws, { type: "error", message: "Invalid pairing code" });
+        ws.close(4003, "Auth failed");
+        return;
+      }
+      if (this.session.pairingExpiresAt && Date.now() > this.session.pairingExpiresAt) {
+        trySendJson(ws, { type: "error", message: "Code expired" });
+        ws.close(4004, "Code expired");
+        return;
+      }
+
+      // Generate app session
+      const appSessionId = crypto.randomUUID();
+      const appToken = await generateSessionToken(this.env.RELAY_SECRET, appSessionId);
+
+      this.session.appSessionId = appSessionId;
+      this.session.paired = true;
+      this.session.pairingCode = null;
+      this.session.pairingExpiresAt = null;
+      this.session.lastActivity = Date.now();
+      await this.ctx.storage.put("session", this.session);
+
+      this.appWs = ws;
+
+      trySendJson(ws, {
+        type: "paired",
+        sessionToken: appToken,
+        sessionId: this.session.pluginSessionId,
+        timestamp: new Date().toISOString(),
+      });
+
+      if (this.pluginWs) {
+        trySendJson(this.pluginWs, {
+          type: "paired",
+          timestamp: new Date().toISOString(),
+        });
+      }
+      return;
+    }
+
+    if (!isPendingPlugin && parsed.token) {
+      // App reconnect with token
+      if (!this.session || !this.session.appSessionId) {
+        trySendJson(ws, { type: "error", message: "Session not found" });
+        ws.close(4002, "No session");
+        return;
+      }
+      const valid = await validateSessionToken(
+        this.env.RELAY_SECRET,
+        this.session.appSessionId,
+        parsed.token,
+      );
+      if (!valid) {
+        trySendJson(ws, { type: "error", message: "Invalid token" });
+        ws.close(4003, "Auth failed");
+        return;
+      }
+
+      this.appWs = ws;
+
+      trySendJson(ws, {
+        type: "reconnected",
+        partnerConnected: this.pluginWs !== null,
+        timestamp: new Date().toISOString(),
+      });
+
+      if (this.pluginWs) {
+        trySendJson(this.pluginWs, {
+          type: "partner_connected",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      this.deliverBufferedMessages(ws, "plugin");
+      return;
+    }
+
+    trySendJson(ws, { type: "error", message: "Missing token or code" });
+    ws.close(4001, "Auth required");
+  }
+
+  /**
    * Deliver buffered messages from a specific sender to the reconnected side.
    */
   private deliverBufferedMessages(ws: WebSocket, fromRole: WebSocketRole): void {
@@ -389,18 +571,44 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
    */
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     await this.ensureSession();
-    if (!this.session) return;
 
     const data = typeof message === "string" ? message : new TextDecoder().decode(message);
 
     // Enforce message size limit
     if (data.length > MAX_MESSAGE_SIZE) {
-      trySendJson(ws, { type: "error", message: "Message too large (max 256KB)" });
+      trySendJson(ws, {
+        type: "error",
+        message: "Message too large (max 256KB)",
+      });
       return;
     }
 
     const tags = this.ctx.getTags(ws);
-    const role = tags.includes("plugin") ? "plugin" : "app";
+
+    // ── Handle pending (unauthenticated) connections ──
+    if (tags.includes("pending-plugin") || tags.includes("pending-app")) {
+      await this.handleAuthMessage(ws, tags, data);
+      return;
+    }
+
+    if (!this.session) return;
+
+    // Determine role — check tags first, then fall back to WS reference
+    // (pending-* tagged connections get promoted via handleAuthMessage
+    // but tags can't be changed in the Hibernation API)
+    let role: WebSocketRole;
+    if (tags.includes("plugin")) {
+      role = "plugin";
+    } else if (tags.includes("app")) {
+      role = "app";
+    } else if (ws === this.pluginWs) {
+      role = "plugin";
+    } else if (ws === this.appWs) {
+      role = "app";
+    } else {
+      // Unknown WS — shouldn't happen, but don't crash
+      return;
+    }
 
     this.session.lastActivity = Date.now();
 
@@ -443,7 +651,13 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     _wasClean: boolean,
   ): Promise<void> {
     const tags = this.ctx.getTags(ws);
-    const role = tags.includes("plugin") ? "plugin" : "app";
+    // Determine role (same logic as webSocketMessage — tags or WS ref)
+    let role: WebSocketRole;
+    if (tags.includes("plugin")) role = "plugin";
+    else if (tags.includes("app")) role = "app";
+    else if (ws === this.pluginWs) role = "plugin";
+    else if (ws === this.appWs) role = "app";
+    else return; // Pending connection that never authenticated — just drop it
     const partner = role === "plugin" ? this.appWs : this.pluginWs;
 
     if (role === "plugin") {
