@@ -17,6 +17,7 @@
  */
 
 import { generateSessionId, validateSessionToken } from "./auth";
+import { isRateLimited, rateLimitResponse } from "./rate-limit";
 
 export { ChannelRoom } from "./channel-room";
 
@@ -79,8 +80,20 @@ export default {
       });
     }
 
+    // Client IP for rate limiting
+    const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
+
     // ── POST /pair — Plugin requests a new pairing session ──
     if (url.pathname === "/pair" && request.method === "POST") {
+      // Rate limit: 3 per 10 min per IP (prevents DO creation spam / denial-of-wallet)
+      if (
+        isRateLimited(`pair:${clientIp}`, {
+          maxRequests: 3,
+          windowMs: 10 * 60_000,
+        })
+      ) {
+        return rateLimitResponse();
+      }
       return handlePair(env);
     }
 
@@ -114,6 +127,16 @@ export default {
       const sessionToken = url.searchParams.get("session");
 
       if (code) {
+        // Rate limit: 5 per min per IP (prevents pairing code brute force)
+        if (
+          isRateLimited(`app-code:${clientIp}`, {
+            maxRequests: 5,
+            windowMs: 60_000,
+          })
+        ) {
+          return rateLimitResponse();
+        }
+
         // Pairing: look up session ID from code, then forward
         const registryId = env.CHANNEL_ROOM.idFromName("__pairing_registry__");
         const registry = env.CHANNEL_ROOM.get(registryId);
