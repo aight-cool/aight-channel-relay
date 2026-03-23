@@ -80,6 +80,11 @@ export default {
       });
     }
 
+    // Guard: RELAY_SECRET must be configured
+    if (!env.RELAY_SECRET) {
+      return jsonResponse({ error: "Server misconfigured: RELAY_SECRET not set" }, 500);
+    }
+
     // Client IP for rate limiting
     const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
 
@@ -226,6 +231,11 @@ async function handlePair(env: Env): Promise<Response> {
       headers: { "Content-Type": "application/json" },
     }),
   );
+
+  if (!doResponse.ok) {
+    const err = await doResponse.text();
+    return jsonResponse({ error: `Session init failed: ${err}` }, 500);
+  }
 
   const { code, sessionToken } = await doResponse.json<{ code: string; sessionToken: string }>();
 
