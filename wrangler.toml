@@ -1,7 +1,6 @@
 name = "channel-relay"
 main = "src/index.ts"
-# Set your own account_id here or via CLOUDFLARE_ACCOUNT_ID env var:
-# account_id = "your-account-id"
+# account_id is set via CLOUDFLARE_ACCOUNT_ID env var (GitHub Actions secret)
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
