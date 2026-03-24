@@ -16,7 +16,13 @@
  * upgrade metadata. The DO parses routing from the original URL.
  */
 
-import { generateSessionId, validateSessionToken } from "./auth";
+import {
+  generateSessionId,
+  validateSessionToken,
+  PAIRING_CODE_RE,
+  SESSION_ID_RE,
+  SESSION_TOKEN_RE,
+} from "./auth";
 import { isRateLimited, rateLimitResponse } from "./rate-limit";
 
 export { ChannelRoom } from "./channel-room";
@@ -138,6 +144,9 @@ export default {
       const sessionId = url.searchParams.get("id");
 
       if (sessionToken && sessionId) {
+        if (!SESSION_TOKEN_RE.test(sessionToken) || !SESSION_ID_RE.test(sessionId)) {
+          return jsonResponse({ error: "Invalid parameter format" }, 400);
+        }
         // Legacy: token in URL (backwards compat)
         const valid = await validateSessionToken(env.RELAY_SECRET, sessionId, sessionToken);
         if (!valid) {
@@ -149,6 +158,9 @@ export default {
       }
 
       if (sessionId) {
+        if (!SESSION_ID_RE.test(sessionId)) {
+          return jsonResponse({ error: "Invalid parameter format" }, 400);
+        }
         // New: token-free URL — auth happens over WS as first message
         const doId = env.CHANNEL_ROOM.idFromName(sessionId);
         const stub = env.CHANNEL_ROOM.get(doId);
@@ -164,6 +176,9 @@ export default {
       const sessionToken = url.searchParams.get("session");
 
       if (code) {
+        if (!PAIRING_CODE_RE.test(code)) {
+          return jsonResponse({ error: "Invalid code format" }, 400);
+        }
         // Rate limit: 5 per min per IP (prevents pairing code brute force)
         if (
           isRateLimited(`app-code:${clientIp}`, {

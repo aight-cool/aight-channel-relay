@@ -33,8 +33,6 @@ interface SessionState {
   pluginSessionId: string;
   /** Session ID for the app side (null until paired) */
   appSessionId: string | null;
-  /** Whether pairing is complete */
-  paired: boolean;
   // messageBuffer removed — kept in volatile memory only (see volatileBuffer)
   /** Timestamp of last activity */
   lastActivity: number;
@@ -47,6 +45,7 @@ interface BufferedMessage {
 }
 
 type WebSocketRole = "plugin" | "app";
+const VALID_ROLES = new Set<string>(["plugin", "app"]);
 
 const PAIRING_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const MESSAGE_BUFFER_SIZE = 10;
@@ -118,7 +117,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       pairingExpiresAt: Date.now() + PAIRING_CODE_TTL_MS,
       pluginSessionId,
       appSessionId: null,
-      paired: false,
       lastActivity: Date.now(),
     };
 
@@ -224,7 +222,10 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       let role: WebSocketRole | null = null;
       if (url.pathname === "/ws/plugin") role = "plugin";
       else if (url.pathname === "/ws/app") role = "app";
-      else role = url.searchParams.get("role") as WebSocketRole | null;
+      else {
+        const roleParam = url.searchParams.get("role");
+        role = roleParam && VALID_ROLES.has(roleParam) ? (roleParam as WebSocketRole) : null;
+      }
 
       const token = url.searchParams.get("session") ?? url.searchParams.get("token");
       const code = url.searchParams.get("code");
@@ -276,14 +277,15 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     this.pluginWs = server;
 
     // Notify plugin of current state
+    const paired = this.session.appSessionId !== null;
     server.send(
       JSON.stringify({
-        type: this.session.paired ? "partner_connected" : "waiting_for_pair",
+        type: paired ? "partner_connected" : "waiting_for_pair",
         timestamp: new Date().toISOString(),
       }),
     );
 
-    if (this.session.paired && this.appWs) {
+    if (paired && this.appWs) {
       trySendJson(this.appWs, { type: "partner_connected", timestamp: new Date().toISOString() });
     }
 
@@ -316,7 +318,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     const appToken = await generateSessionToken(this.env.RELAY_SECRET, appSessionId);
 
     this.session.appSessionId = appSessionId;
-    this.session.paired = true;
     this.session.pairingCode = null;
     this.session.pairingExpiresAt = null;
     this.session.lastActivity = Date.now();
@@ -464,12 +465,13 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       // Note: Hibernation API doesn't support changing tags, so we track via the WS ref
       this.pluginWs = ws;
 
+      const paired = this.session.appSessionId !== null;
       trySendJson(ws, {
-        type: this.session.paired ? "partner_connected" : "waiting_for_pair",
+        type: paired ? "partner_connected" : "waiting_for_pair",
         timestamp: new Date().toISOString(),
       });
 
-      if (this.session.paired && this.appWs) {
+      if (paired && this.appWs) {
         trySendJson(this.appWs, {
           type: "partner_connected",
           timestamp: new Date().toISOString(),
@@ -503,7 +505,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       const appToken = await generateSessionToken(this.env.RELAY_SECRET, appSessionId);
 
       this.session.appSessionId = appSessionId;
-      this.session.paired = true;
       this.session.pairingCode = null;
       this.session.pairingExpiresAt = null;
       this.session.lastActivity = Date.now();
@@ -714,18 +715,11 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     // If no activity for the timeout period, clean up
     if (Date.now() - this.session.lastActivity > INACTIVITY_TIMEOUT_MS) {
       // Close any remaining connections
-      if (this.pluginWs) {
+      for (const ws of [this.pluginWs, this.appWs]) {
         try {
-          this.pluginWs.close(1000, "Session expired");
+          ws?.close(1000, "Session expired");
         } catch {
-          // Already closed
-        }
-      }
-      if (this.appWs) {
-        try {
-          this.appWs.close(1000, "Session expired");
-        } catch {
-          // Already closed
+          /* already closed */
         }
       }
       this.session = null;

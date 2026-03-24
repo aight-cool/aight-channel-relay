@@ -1,16 +1,13 @@
 name = "channel-relay"
 main = "src/index.ts"
-account_id = "09385734b0e448260193c7f758a44d0b"
+# Set your own account_id here or via CLOUDFLARE_ACCOUNT_ID env var:
+# account_id = "your-account-id"
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Custom domain: channels.aight.cool (configure in Cloudflare dashboard)
-# routes = [{ pattern = "channels.aight.cool/*", zone_name = "aight.cool" }]
+# Custom domain (configure in Cloudflare dashboard after deploying):
+# routes = [{ pattern = "channels.example.com/*", zone_name = "example.com" }]
 
-# Secrets (set via `wrangler secret put`):
-# RELAY_SECRET — HMAC signing key for session tokens
-
-# RELAY_SECRET is set via `wrangler secret put RELAY_SECRET` for production.
 # For local dev, create a .dev.vars file (gitignored):
 #   RELAY_SECRET=your-dev-secret-here
 

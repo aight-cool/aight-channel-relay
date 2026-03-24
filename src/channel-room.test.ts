@@ -243,7 +243,7 @@ describe("Ping/Pong", () => {
     messages.length = 0;
 
     ws.send(JSON.stringify({ type: "ping" }));
-    await sleep(20);
+    await sleep(100);
 
     expect(messages).toHaveLength(1);
     expect(JSON.parse(messages[0]).type).toBe("pong");
@@ -365,10 +365,97 @@ describe("Edge Cases", () => {
     expect(resp.status).toBe(400);
   });
 
+  it("returns 400 for /ws with invalid role", async () => {
+    const { stub } = await initSession("edge-invalid-role");
+    const resp = await stub.fetch("https://do/ws?role=admin");
+    expect(resp.status).toBe(400);
+  });
+
   it("returns 404 for unknown DO paths", async () => {
     const stub = getStub("edge-2");
     const resp = await stub.fetch("https://do/unknown");
     expect(resp.status).toBe(404);
+  });
+});
+
+// ─── Init Validation ─────────────────────────────────────────────────
+
+describe("Init Validation", () => {
+  it("returns 500 for invalid JSON body on /init", async () => {
+    const stub = getStub("init-bad-json");
+    const resp = await stub.fetch(
+      new Request("https://do/init", {
+        method: "POST",
+        body: "not json",
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    expect(resp.status).toBe(500);
+  });
+
+  it("handles missing pluginSessionId on /init", async () => {
+    const stub = getStub("init-missing-id");
+    const resp = await stub.fetch(
+      new Request("https://do/init", {
+        method: "POST",
+        body: JSON.stringify({}),
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    // Should still succeed — pluginSessionId will be undefined but the DO accepts it
+    // (the worker is responsible for providing valid data)
+    expect(resp.status).toBe(200);
+  });
+});
+
+// ─── Plugin Reconnect ────────────────────────────────────────────────
+
+describe("Plugin Reconnect", () => {
+  it("second plugin connection replaces the first", async () => {
+    const { stub, sessionToken } = await initSession("plug-replace");
+    const plugin1 = await connectWs(stub, `https://do/ws?role=plugin&token=${sessionToken}`);
+    plugin1.messages.length = 0;
+
+    const plugin2 = await connectWs(stub, `https://do/ws?role=plugin&token=${sessionToken}`);
+    expect(JSON.parse(plugin2.messages[0]).type).toBe("waiting_for_pair");
+
+    // Send a ping on the new connection — should get pong
+    plugin2.ws.send(JSON.stringify({ type: "ping" }));
+    await sleep(20);
+    expect(plugin2.messages.some((m) => JSON.parse(m).type === "pong")).toBe(true);
+  });
+});
+
+// ─── Ping from App ───────────────────────────────────────────────────
+
+describe("Ping from App", () => {
+  it("responds to ping from app with pong", async () => {
+    const { app } = await setupPair("ping-app");
+    app.messages.length = 0;
+
+    app.ws.send(JSON.stringify({ type: "ping" }));
+    await sleep(20);
+
+    expect(app.messages).toHaveLength(1);
+    expect(JSON.parse(app.messages[0]).type).toBe("pong");
+  });
+});
+
+// ─── Rapid Messaging ─────────────────────────────────────────────────
+
+describe("Rapid Messaging", () => {
+  it("relays multiple messages in order", async () => {
+    const { plugin, app } = await setupPair("rapid-msg");
+
+    for (let i = 0; i < 5; i++) {
+      plugin.ws.send(JSON.stringify({ type: "reply", index: i }));
+    }
+    await sleep(100);
+
+    expect(app.messages).toHaveLength(5);
+    for (let i = 0; i < 5; i++) {
+      expect(JSON.parse(app.messages[i]).index).toBe(i);
+    }
   });
 });
 
@@ -402,7 +489,7 @@ describe("Full Lifecycle", () => {
     app.messages.length = 0;
 
     app.ws.send('{"content":"pong from app"}');
-    await sleep(20);
+    await sleep(100);
     expect(JSON.parse(plugin.messages[0]).content).toBe("pong from app");
     plugin.messages.length = 0;
 

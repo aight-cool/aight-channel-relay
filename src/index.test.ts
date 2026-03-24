@@ -72,7 +72,9 @@ describe("GET /ws/plugin", () => {
   });
 
   it("returns 403 with invalid token", async () => {
-    const resp = await SELF.fetch("https://relay/ws/plugin?session=bad&id=fake-session");
+    const resp = await SELF.fetch(
+      "https://relay/ws/plugin?session=0000000000000000000000000000000000000000000000000000000000000000&id=00000000000000000000000000000000",
+    );
     expect(resp.status).toBe(403);
   });
 });
@@ -93,6 +95,33 @@ describe("GET /ws/app", () => {
   it("returns 403 with invalid pairing code", async () => {
     const resp = await SELF.fetch("https://relay/ws/app?code=000000");
     expect(resp.status).toBe(403);
+  });
+});
+
+// ─── Input Validation ────────────────────────────────────────────────
+
+describe("Input Validation", () => {
+  it("rejects /ws/app?code with non-numeric code", async () => {
+    const resp = await SELF.fetch("https://relay/ws/app?code=abcdef");
+    expect(resp.status).toBe(400);
+    const body = await resp.json<{ error: string }>();
+    expect(body.error).toBe("Invalid code format");
+  });
+
+  it("returns CORS headers on error responses", async () => {
+    const resp = await SELF.fetch("https://relay/ws/app?code=bad!");
+    expect(resp.status).toBe(400);
+    expect(resp.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
+
+  it("returns 404 for GET /pair (wrong method)", async () => {
+    const resp = await SELF.fetch("https://relay/pair");
+    expect(resp.status).toBe(404);
+  });
+
+  it("returns 404 for POST / (wrong method)", async () => {
+    const resp = await SELF.fetch("https://relay/", { method: "POST" });
+    expect(resp.status).toBe(404);
   });
 });
 

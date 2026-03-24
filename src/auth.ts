@@ -1,9 +1,17 @@
 /**
  * HMAC-based session token generation and verification.
- * Same pattern as push-relay's sendKey auth.
  */
 
 const encoder = new TextEncoder();
+
+/** Matches a 6-digit numeric pairing code. */
+export const PAIRING_CODE_RE = /^\d{6}$/;
+
+/** Matches a 32-character lowercase hex session ID (16 random bytes). */
+export const SESSION_ID_RE = /^[0-9a-f]{32}$/;
+
+/** Matches a 64-character lowercase hex token (SHA-256 HMAC output). */
+export const SESSION_TOKEN_RE = /^[0-9a-f]{64}$/;
 
 /**
  * Generate a session token: HMAC-SHA256(secret, "v1:" + sessionId) as hex.
