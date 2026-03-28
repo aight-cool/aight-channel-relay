@@ -126,7 +126,7 @@ export default {
     }
 
     // ── GET /debug/push/:sessionId — check push state (temporary) ──
-    const debugPushMatch = url.pathname.match(/^\/debug\/push\/([0-9a-f]{32})$/);
+    const debugPushMatch = url.pathname.match(/^\/debug\/push\/([0-9a-f-]{32,36})$/);
     if (debugPushMatch && request.method === "GET") {
       const sessionId = debugPushMatch[1];
       const doId = env.CHANNEL_ROOM.idFromName(sessionId);
