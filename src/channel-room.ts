@@ -548,7 +548,11 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         tags: this.ctx.getTags(ws),
         readyState: ws.readyState,
       }));
+      const session = await this.ctx.storage.get("session");
+      const allKeys = await this.ctx.storage.list();
       return Response.json({
+        storageKeys: [...allKeys.keys()],
+        sessionInStorage: !!session,
         hasCredentials: !!push,
         platform: push?.platform,
         sandbox: push?.sandbox,
