@@ -800,6 +800,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
    * Expects: { type: "auth", token: "...", id?: "..." } or { type: "auth", code: "..." }
    */
   private async handleAuthMessage(ws: WebSocket, tags: string[], data: string): Promise<void> {
+    console.error(`[DEBUG] handleAuthMessage tags=${tags.join(",")}`);
     let parsed: { type?: string; token?: string; code?: string; id?: string };
     try {
       parsed = JSON.parse(data);
@@ -995,6 +996,16 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     if (!this.session) return;
 
     this.session.lastActivity = Date.now();
+
+    // DEBUG: log all app messages to diagnose push registration
+    if (role === "app") {
+      try {
+        const dbg = JSON.parse(data);
+        console.error(`[DEBUG] App msg type=${dbg.type}`);
+      } catch {
+        console.error(`[DEBUG] App msg (non-JSON) len=${data.length}`);
+      }
+    }
 
     // Parse for protocol-level messages (ping/pong, catch_up, register_push)
     try {
