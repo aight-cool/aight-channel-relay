@@ -299,21 +299,26 @@ describe("Message Buffering", () => {
 
     expect(app2.messages.length).toBeGreaterThanOrEqual(3);
     expect(JSON.parse(app2.messages[0]).type).toBe("reconnected");
-    expect(JSON.parse(app2.messages[1]).content).toBe("buffered-1");
-    expect(JSON.parse(app2.messages[2]).content).toBe("buffered-2");
+    // Buffered messages are now wrapped in { type: "buffered", seq, payload }
+    const buf1 = JSON.parse(app2.messages[1]);
+    expect(buf1.type).toBe("buffered");
+    expect(JSON.parse(buf1.payload).content).toBe("buffered-1");
+    const buf2 = JSON.parse(app2.messages[2]);
+    expect(buf2.type).toBe("buffered");
+    expect(JSON.parse(buf2.payload).content).toBe("buffered-2");
   });
 
-  it("limits buffer to 10 messages (global cap)", async () => {
+  it("limits buffer to 100 messages (persistent cap)", async () => {
     const { stub, plugin, app, appToken } = await setupPair("buf-limit");
 
     app.ws.close();
     await sleep(50);
 
-    // Send 15 messages — each triggers an async storage write in bufferMessage,
-    // so we need enough time for all 15 to be processed sequentially by the DO.
+    // Send 15 messages — each triggers an async storage write in bufferMessage.
+    // Cap is now 100 so all 15 should be buffered.
     for (let i = 0; i < 15; i++) {
       plugin.ws.send(`{"content":"msg-${i}"}`);
-      await sleep(10); // space out sends to avoid overwhelming the DO
+      await sleep(10);
     }
     await sleep(200);
 
@@ -321,14 +326,14 @@ describe("Message Buffering", () => {
 
     const buffered = app2.messages.filter((m) => {
       try {
-        return JSON.parse(m).content !== undefined;
+        return JSON.parse(m).type === "buffered";
       } catch {
         return false;
       }
     });
-    expect(buffered).toHaveLength(10);
-    expect(JSON.parse(buffered[0]).content).toBe("msg-5");
-    expect(JSON.parse(buffered[9]).content).toBe("msg-14");
+    expect(buffered).toHaveLength(15);
+    expect(JSON.parse(JSON.parse(buffered[0]).payload).content).toBe("msg-0");
+    expect(JSON.parse(JSON.parse(buffered[14]).payload).content).toBe("msg-14");
   });
 });
 
@@ -449,12 +454,17 @@ describe("Rapid Messaging", () => {
 
     for (let i = 0; i < 5; i++) {
       plugin.ws.send(JSON.stringify({ type: "reply", index: i }));
+      await sleep(10); // Space out sends for async alarm management
     }
-    await sleep(100);
+    await sleep(200);
 
-    expect(app.messages).toHaveLength(5);
+    // Filter to only our reply messages (skip any late protocol messages)
+    const replies = app.messages
+      .map((m) => JSON.parse(m))
+      .filter((m: { type?: string }) => m.type === "reply");
+    expect(replies).toHaveLength(5);
     for (let i = 0; i < 5; i++) {
-      expect(JSON.parse(app.messages[i]).index).toBe(i);
+      expect(replies[i].index).toBe(i);
     }
   });
 });
@@ -503,12 +513,14 @@ describe("Full Lifecycle", () => {
     plugin.ws.send('{"content":"offline msg"}');
     await sleep(100);
 
-    // 6. App reconnects — gets buffered messages
+    // 6. App reconnects — gets buffered messages (now wrapped in "buffered" type)
     const app2 = await connectWs(stub, `https://do/ws?role=app&token=${appToken}`);
     expect(JSON.parse(app2.messages[0]).type).toBe("reconnected");
     expect(JSON.parse(app2.messages[0]).partnerConnected).toBe(true);
     expect(app2.messages.length).toBeGreaterThanOrEqual(2);
-    expect(JSON.parse(app2.messages[1]).content).toBe("offline msg");
+    const bufferedMsg = JSON.parse(app2.messages[1]);
+    expect(bufferedMsg.type).toBe("buffered");
+    expect(JSON.parse(bufferedMsg.payload).content).toBe("offline msg");
 
     // Plugin notified of app reconnection
     await sleep(20);
