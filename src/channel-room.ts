@@ -61,10 +61,27 @@ function trySendJson(ws: WebSocket, payload: Record<string, unknown>): void {
   }
 }
 
+/** Close a WebSocket gracefully, ignoring errors if already closed. */
+function tryClose(ws: WebSocket, code: number, reason: string): void {
+  try {
+    ws.close(code, reason);
+  } catch {
+    // Already closed
+  }
+}
+
 export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
   private session: SessionState | null = null;
   private pluginWs: WebSocket | null = null;
   private appWs: WebSocket | null = null;
+
+  /** Replace a role's WebSocket, closing the stale one if it differs. */
+  private setRoleWs(role: WebSocketRole, ws: WebSocket): void {
+    const prev = role === "plugin" ? this.pluginWs : this.appWs;
+    if (prev && prev !== ws) tryClose(prev, 4010, "Replaced by new connection");
+    if (role === "plugin") this.pluginWs = ws;
+    else this.appWs = ws;
+  }
 
   /**
    * In-memory only message buffer for reconnection.
@@ -274,7 +291,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     const [client, server] = Object.values(pair);
 
     this.ctx.acceptWebSocket(server, ["plugin"]);
-    this.pluginWs = server;
+    this.setRoleWs("plugin", server);
 
     // Notify plugin of current state
     const paired = this.session.appSessionId !== null;
@@ -329,7 +346,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     const [client, server] = Object.values(pair);
 
     this.ctx.acceptWebSocket(server, ["app"]);
-    this.appWs = server;
+    this.setRoleWs("app", server);
 
     // Send pairing confirmation with app's session token and session ID
     // (session ID needed for reconnection — the outer worker uses it to find this DO)
@@ -370,7 +387,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     const [client, server] = Object.values(pair);
 
     this.ctx.acceptWebSocket(server, ["app"]);
-    this.appWs = server;
+    this.setRoleWs("app", server);
 
     // Send reconnection confirmation
     server.send(
@@ -463,7 +480,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
       // Authenticated — promote to full plugin connection
       // Note: Hibernation API doesn't support changing tags, so we track via the WS ref
-      this.pluginWs = ws;
+      this.setRoleWs("plugin", ws);
 
       const paired = this.session.appSessionId !== null;
       trySendJson(ws, {
@@ -510,7 +527,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       this.session.lastActivity = Date.now();
       await this.ctx.storage.put("session", this.session);
 
-      this.appWs = ws;
+      this.setRoleWs("app", ws);
 
       trySendJson(ws, {
         type: "paired",
@@ -546,7 +563,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         return;
       }
 
-      this.appWs = ws;
+      this.setRoleWs("app", ws);
 
       trySendJson(ws, {
         type: "reconnected",
@@ -685,9 +702,11 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     else return; // Pending connection that never authenticated — just drop it
     const partner = role === "plugin" ? this.appWs : this.pluginWs;
 
-    if (role === "plugin") {
+    // Only nullify the ref if the closing WS is the current one.
+    // Stale WebSockets from previous connections must not wipe the active ref.
+    if (role === "plugin" && ws === this.pluginWs) {
       this.pluginWs = null;
-    } else {
+    } else if (role === "app" && ws === this.appWs) {
       this.appWs = null;
     }
 
