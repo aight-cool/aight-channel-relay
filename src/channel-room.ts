@@ -75,6 +75,25 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
   private pluginWs: WebSocket | null = null;
   private appWs: WebSocket | null = null;
 
+  /**
+   * Self-heal: scan live WebSockets for a role whose ref is null or stale.
+   * Returns the recovered WS (and updates the ref) or null if none found.
+   */
+  private healRoleRef(role: WebSocketRole): WebSocket | null {
+    const tagMatches = role === "plugin"
+      ? ["plugin", "pending-plugin"]
+      : ["app", "pending-app"];
+    for (const ws of this.ctx.getWebSockets()) {
+      const tags = this.ctx.getTags(ws);
+      if (tagMatches.some((t) => tags.includes(t))) {
+        if (role === "plugin") this.pluginWs = ws;
+        else this.appWs = ws;
+        return ws;
+      }
+    }
+    return null;
+  }
+
   /** Replace a role's WebSocket, closing the stale one if it differs. */
   private setRoleWs(role: WebSocketRole, ws: WebSocket): void {
     const prev = role === "plugin" ? this.pluginWs : this.appWs;
@@ -96,12 +115,28 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     // Restore WebSocket references after hibernation.
     // The runtime keeps the connections alive but our in-memory
     // references (pluginWs, appWs) are lost when the DO is evicted.
+    // Multiple WSes per role can exist (stale connections from reconnects).
+    // Keep only the last one per role and close the rest.
+    const pluginWss: WebSocket[] = [];
+    const appWss: WebSocket[] = [];
     for (const ws of this.ctx.getWebSockets()) {
       const tags = this.ctx.getTags(ws);
       if (tags.includes("plugin") || tags.includes("pending-plugin")) {
-        this.pluginWs = ws;
+        pluginWss.push(ws);
       } else if (tags.includes("app") || tags.includes("pending-app")) {
-        this.appWs = ws;
+        appWss.push(ws);
+      }
+    }
+    if (pluginWss.length > 0) {
+      this.pluginWs = pluginWss[pluginWss.length - 1];
+      for (let i = 0; i < pluginWss.length - 1; i++) {
+        tryClose(pluginWss[i], 4010, "Stale connection after hibernation");
+      }
+    }
+    if (appWss.length > 0) {
+      this.appWs = appWss[appWss.length - 1];
+      for (let i = 0; i < appWss.length - 1; i++) {
+        tryClose(appWss[i], 4010, "Stale connection after hibernation");
       }
     }
   }
@@ -669,17 +704,29 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     }
 
     // Forward to the other side
-    const target = role === "plugin" ? this.appWs : this.pluginWs;
+    const targetRole: WebSocketRole = role === "plugin" ? "app" : "plugin";
+    let target = targetRole === "app" ? this.appWs : this.pluginWs;
+
     if (target) {
       try {
         target.send(data);
       } catch {
-        // Target disconnected, buffer it
-        this.bufferMessage(role, data);
+        // Target ref is stale — attempt self-heal before buffering
+        target = this.healRoleRef(targetRole);
+        if (target) {
+          try { target.send(data); } catch { this.bufferMessage(role, data); }
+        } else {
+          this.bufferMessage(role, data);
+        }
       }
     } else {
-      // Other side not connected, buffer it
-      this.bufferMessage(role, data);
+      // No ref — attempt self-heal from live WebSockets
+      target = this.healRoleRef(targetRole);
+      if (target) {
+        try { target.send(data); } catch { this.bufferMessage(role, data); }
+      } else {
+        this.bufferMessage(role, data);
+      }
     }
   }
 
