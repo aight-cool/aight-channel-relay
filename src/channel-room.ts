@@ -543,6 +543,11 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       const push = await this.ctx.storage.get<PushCredentials>("push");
       const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
       const appMsgs = await this.ctx.storage.get<string[]>("_debug_app_msgs");
+      const allWs = this.ctx.getWebSockets();
+      const wsInfo = allWs.map((ws) => ({
+        tags: this.ctx.getTags(ws),
+        readyState: ws.readyState,
+      }));
       return Response.json({
         hasCredentials: !!push,
         platform: push?.platform,
@@ -550,8 +555,10 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         tokenPrefix: push?.pushToken?.slice(0, 10),
         sendKeyPrefix: push?.sendKey?.slice(0, 10),
         pushInvalid: !!pushInvalid,
-        appWsConnected: this.appWs !== null,
-        pluginWsConnected: this.pluginWs !== null,
+        appWsRef: this.appWs !== null,
+        pluginWsRef: this.pluginWs !== null,
+        hibernatedWs: wsInfo,
+        sessionExists: this.session !== null,
         appMessages: appMsgs ?? [],
       });
     }
