@@ -368,16 +368,27 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
    */
   private async maybeSendPush(messageData: string): Promise<void> {
     const now = Date.now();
-    if (now - this.lastPushAt < PUSH_DEBOUNCE_MS) return;
+    if (now - this.lastPushAt < PUSH_DEBOUNCE_MS) {
+      console.error("[Push] Debounced — skipping");
+      return;
+    }
 
     const push = await this.ctx.storage.get<PushCredentials>("push");
-    if (!push) return;
+    if (!push) {
+      console.error("[Push] No push credentials in storage — register_push never received?");
+      return;
+    }
 
     // Check if push was invalidated
     const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
-    if (pushInvalid) return;
+    if (pushInvalid) {
+      console.error("[Push] Push credentials invalidated — waiting for re-register");
+      return;
+    }
 
     this.lastPushAt = now;
+
+    console.error("[Push] Sending push — token:", push.pushToken.slice(0, 10) + "...", "platform:", push.platform, "sandbox:", push.sandbox);
 
     // Extract preview from message (best-effort)
     let body = "New message";
@@ -410,12 +421,15 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         }),
       })
         .then(async (res) => {
-          // 403 = invalid sendKey — mark for re-registration
+          const resBody = await res.text();
+          console.error("[Push] Response:", res.status, resBody);
           if (res.status === 403) {
             await this.ctx.storage.put("pushInvalid", true);
           }
         })
-        .catch(() => {}), // Swallow errors — push is best-effort
+        .catch((err) => {
+          console.error("[Push] Fetch error:", err);
+        }),
     );
   }
 
@@ -988,6 +1002,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         }
 
         if (parsed.type === "register_push") {
+          console.error("[Push] register_push received — token:", String(parsed.pushToken).slice(0, 10) + "...", "platform:", parsed.platform, "sandbox:", parsed.sandbox);
           const creds: PushCredentials = {
             pushToken: parsed.pushToken,
             sendKey: parsed.sendKey,
