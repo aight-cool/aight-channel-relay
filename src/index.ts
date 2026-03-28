@@ -10,6 +10,7 @@
  *   GET  /ws/plugin?session=<tok>&id=<id> — Plugin WebSocket connection
  *   GET  /ws/app?code=<code>      — App WebSocket connection (first pair)
  *   GET  /ws/app?session=<tok>&id=<id>    — App WebSocket reconnection
+ *   POST /messages/:sessionId     — HTTP catch-up for buffered messages
  *
  * WebSocket requests are forwarded to the DO using the ORIGINAL request
  * object — this is required to preserve Cloudflare's internal WebSocket
@@ -51,7 +52,7 @@ function getCorsHeaders(request: Request): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
   };
 }
 
@@ -64,7 +65,7 @@ function jsonResponse(data: unknown, status = 200): Response {
     headers: {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
     },
   });
 }
@@ -136,6 +137,40 @@ export default {
         return rateLimitResponse();
       }
       return handlePair(env);
+    }
+
+    // ── POST /messages/:sessionId — HTTP catch-up for buffered messages ──
+    const messagesMatch = url.pathname.match(/^\/messages\/([0-9a-f]{32})$/);
+    if (messagesMatch && request.method === "POST") {
+      const sessionId = messagesMatch[1];
+
+      // Rate limit: 5 per min per IP (same as /ws/app — prevents polling abuse)
+      if (
+        isRateLimited(`messages:${clientIp}`, {
+          maxRequests: 5,
+          windowMs: 60_000,
+        })
+      ) {
+        return rateLimitResponse();
+      }
+
+      // Forward to the session's DO — auth happens inside getBufferedMessages
+      const doId = env.CHANNEL_ROOM.idFromName(sessionId);
+      const stub = env.CHANNEL_ROOM.get(doId);
+      const doResp = await stub.fetch(
+        new Request("https://do/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: request.headers.get("Authorization") ?? "",
+          },
+          body: request.body,
+        }),
+      );
+
+      // Forward DO response with CORS headers
+      const respData = await doResp.json();
+      return jsonResponse(respData, doResp.status);
     }
 
     // ── GET /ws/plugin — Plugin WebSocket ──

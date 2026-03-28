@@ -26,7 +26,7 @@ describe("OPTIONS preflight", () => {
     const resp = await SELF.fetch("https://relay/pair", { method: "OPTIONS" });
     expect(resp.status).toBe(204);
     expect(resp.headers.get("Access-Control-Allow-Methods")).toBe("GET, POST, OPTIONS");
-    expect(resp.headers.get("Access-Control-Allow-Headers")).toBe("Content-Type");
+    expect(resp.headers.get("Access-Control-Allow-Headers")).toBe("Content-Type, Authorization");
   });
 });
 

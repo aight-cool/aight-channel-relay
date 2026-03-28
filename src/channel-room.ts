@@ -10,6 +10,10 @@
  *   3. App connects via WS with pairing code → gets its own session token
  *   4. Messages flow bidirectionally
  *   5. Auto-cleanup when both sides disconnect
+ *
+ * Message buffering:
+ *   Messages sent while the other side is disconnected are persisted to DO
+ *   storage (survives eviction). Up to 100 messages, 24h TTL.
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -33,24 +37,49 @@ interface SessionState {
   pluginSessionId: string;
   /** Session ID for the app side (null until paired) */
   appSessionId: string | null;
-  // messageBuffer removed — kept in volatile memory only (see volatileBuffer)
   /** Timestamp of last activity */
   lastActivity: number;
 }
 
-interface BufferedMessage {
-  from: "plugin" | "app";
+/** Persisted message in DO storage under "msg:<seq>" keys */
+interface BufferedStorageMsg {
+  from: WebSocketRole;
   data: string;
-  timestamp: number;
+  ts: number;
+}
+
+/** Push credentials stored under "push" key */
+interface PushCredentials {
+  pushToken: string;
+  sendKey: string;
+  platform: string;
+  sandbox: boolean;
 }
 
 type WebSocketRole = "plugin" | "app";
 const VALID_ROLES = new Set<string>(["plugin", "app"]);
 
 const PAIRING_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const MESSAGE_BUFFER_SIZE = 10;
+const MESSAGE_BUFFER_CAP = 100;
+const MESSAGE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+const ALARM_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const MAX_MESSAGE_SIZE = 256 * 1024; // 256KB max message size
+const PUSH_DEBOUNCE_MS = 30_000;
+const PUSH_SERVICE_URL = "https://push.aight.cool/send";
+
+/** Extract sequence number from a "msg:<seq>" storage key. */
+function parseSeqFromKey(key: string): number {
+  return parseInt(key.split(":")[1]);
+}
+
+/** Sort comparator for [key, msg] entries by sequence number. */
+function compareBySeq(
+  a: [string, BufferedStorageMsg],
+  b: [string, BufferedStorageMsg],
+): number {
+  return parseSeqFromKey(a[0]) - parseSeqFromKey(b[0]);
+}
 
 /** Send a JSON message to a WebSocket, silently ignoring errors (e.g. disconnected). */
 function trySendJson(ws: WebSocket, payload: Record<string, unknown>): void {
@@ -66,12 +95,10 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
   private pluginWs: WebSocket | null = null;
   private appWs: WebSocket | null = null;
 
-  /**
-   * In-memory only message buffer for reconnection.
-   * NOT persisted to storage — messages are lost if the DO evicts.
-   * This is intentional: we don't store user content on disk.
-   */
-  private volatileBuffer: BufferedMessage[] = [];
+  /** Volatile — fine to re-push after DO eviction */
+  private lastPushAt = 0;
+  /** Memory cache for hasBufferedMessages — avoids 2 storage reads per message */
+  private cachedHasBuffered: boolean | null = null;
 
   constructor(ctx: DurableObjectState, env: { RELAY_SECRET: string }) {
     super(ctx, env);
@@ -105,6 +132,249 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     return this.session;
   }
 
+  // ── Persistent Message Buffer ───────────────────────────────────────────────
+
+  /**
+   * Buffer a message to DO storage for reconnection delivery.
+   */
+  private async bufferMessage(from: WebSocketRole, data: string): Promise<void> {
+    const seq = ((await this.ctx.storage.get<number>("msgSeq")) ?? 0) + 1;
+    const countKey = `msgCount:${from}`;
+    const count = ((await this.ctx.storage.get<number>(countKey)) ?? 0) + 1;
+
+    await this.ctx.storage.put({
+      [`msg:${seq}`]: { from, data, ts: Date.now() } satisfies BufferedStorageMsg,
+      msgSeq: seq,
+      [countKey]: count,
+    });
+
+    this.cachedHasBuffered = true;
+
+    // Only check eviction when approaching cap
+    if (count >= MESSAGE_BUFFER_CAP) {
+      await this.evictIfOverCap();
+    }
+  }
+
+  /**
+   * Deliver buffered messages from a specific sender to the reconnected side.
+   * Optionally filter to only messages after a given seq (for catch_up).
+   */
+  private async deliverBufferedMessages(
+    ws: WebSocket,
+    fromRole: WebSocketRole,
+    afterSeq = 0,
+  ): Promise<void> {
+    const seq = (await this.ctx.storage.get<number>("msgSeq")) ?? 0;
+    if (seq === 0) return;
+
+    const entries = await this.ctx.storage.list<BufferedStorageMsg>({ prefix: "msg:" });
+    const toDeliver: [string, BufferedStorageMsg][] = [];
+
+    for (const [key, msg] of entries) {
+      if (msg.from !== fromRole) continue;
+      if (parseSeqFromKey(key) <= afterSeq) continue;
+      toDeliver.push([key, msg]);
+    }
+
+    toDeliver.sort(compareBySeq);
+
+    const oldestAvailableSeq = toDeliver.length > 0 ? parseSeqFromKey(toDeliver[0][0]) : 0;
+
+    const sentKeys: string[] = [];
+    for (let i = 0; i < toDeliver.length; i++) {
+      const [key, msg] = toDeliver[i];
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "buffered",
+            seq: parseSeqFromKey(key),
+            payload: msg.data,
+            ...(i === 0 ? { oldestAvailableSeq } : {}),
+          }),
+        );
+        sentKeys.push(key);
+      } catch {
+        break;
+      }
+    }
+
+    if (sentKeys.length > 0) {
+      await this.ctx.storage.delete(sentKeys);
+      const remaining = toDeliver.length - sentKeys.length;
+      await this.ctx.storage.put(`msgCount:${fromRole}`, remaining);
+      this.cachedHasBuffered = null; // Invalidate cache
+    }
+  }
+
+  private async evictIfOverCap(): Promise<void> {
+    const entries = await this.ctx.storage.list<BufferedStorageMsg>({ prefix: "msg:" });
+    if (entries.size <= MESSAGE_BUFFER_CAP) return;
+
+    const sorted = [...entries.entries()].sort(compareBySeq);
+    const toDelete = sorted.slice(0, sorted.length - MESSAGE_BUFFER_CAP);
+    if (toDelete.length === 0) return;
+
+    // Count deleted per role, subtract from current counts
+    let pluginDeleted = 0;
+    let appDeleted = 0;
+    for (const [, msg] of toDelete) {
+      if (msg.from === "plugin") pluginDeleted++;
+      else appDeleted++;
+    }
+
+    const pluginCount =
+      ((await this.ctx.storage.get<number>("msgCount:plugin")) ?? 0) - pluginDeleted;
+    const appCount =
+      ((await this.ctx.storage.get<number>("msgCount:app")) ?? 0) - appDeleted;
+
+    await this.ctx.storage.delete(toDelete.map(([key]) => key));
+    await this.ctx.storage.put({
+      "msgCount:plugin": Math.max(0, pluginCount),
+      "msgCount:app": Math.max(0, appCount),
+    });
+  }
+
+  private async pruneExpiredMessages(olderThan: number): Promise<void> {
+    const entries = await this.ctx.storage.list<BufferedStorageMsg>({ prefix: "msg:" });
+    const toDeleteSet = new Set<string>();
+
+    for (const [key, msg] of entries) {
+      if (msg.ts < olderThan) {
+        toDeleteSet.add(key);
+      }
+    }
+
+    if (toDeleteSet.size > 0) {
+      await this.ctx.storage.delete([...toDeleteSet]);
+
+      let pluginCount = 0;
+      let appCount = 0;
+      for (const [key, msg] of entries) {
+        if (!toDeleteSet.has(key)) {
+          if (msg.from === "plugin") pluginCount++;
+          else appCount++;
+        }
+      }
+      await this.ctx.storage.put({
+        "msgCount:plugin": pluginCount,
+        "msgCount:app": appCount,
+      });
+      this.cachedHasBuffered = pluginCount + appCount > 0;
+    }
+  }
+
+  private async hasBufferedMessages(): Promise<boolean> {
+    if (this.cachedHasBuffered !== null) return this.cachedHasBuffered;
+    const pluginCount = (await this.ctx.storage.get<number>("msgCount:plugin")) ?? 0;
+    const appCount = (await this.ctx.storage.get<number>("msgCount:app")) ?? 0;
+    this.cachedHasBuffered = pluginCount + appCount > 0;
+    return this.cachedHasBuffered;
+  }
+
+  /**
+   * Get buffered messages for an HTTP catch-up request (read-only, no delete).
+   */
+  async getBufferedMessages(
+    token: string,
+    afterSeq: number,
+  ): Promise<{
+    messages: Array<{ seq: number; data: string; ts: number }>;
+    latestSeq: number;
+    oldestAvailableSeq: number;
+  } | null> {
+    await this.ensureSession();
+    if (!this.session || !this.session.appSessionId) return null;
+
+    const valid = await validateSessionToken(
+      this.env.RELAY_SECRET,
+      this.session.appSessionId,
+      token,
+    );
+    if (!valid) return null;
+
+    const latestSeq = (await this.ctx.storage.get<number>("msgSeq")) ?? 0;
+    const entries = await this.ctx.storage.list<BufferedStorageMsg>({ prefix: "msg:" });
+
+    const messages: Array<{ seq: number; data: string; ts: number }> = [];
+    let oldestAvailableSeq = 0;
+
+    const sorted = [...entries.entries()]
+      .filter(([, msg]) => msg.from === "plugin")
+      .sort(compareBySeq);
+
+    for (const [key, msg] of sorted) {
+      const seq = parseSeqFromKey(key);
+      if (oldestAvailableSeq === 0) oldestAvailableSeq = seq;
+      if (seq > afterSeq) {
+        messages.push({ seq, data: msg.data, ts: msg.ts });
+      }
+    }
+
+    return { messages, latestSeq, oldestAvailableSeq };
+  }
+
+  // ── Push Notifications ──────────────────────────────────────────────────────
+
+  /**
+   * Maybe send a push notification for a buffered message.
+   * Debounced to avoid spamming the user.
+   */
+  private async maybeSendPush(messageData: string): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastPushAt < PUSH_DEBOUNCE_MS) return;
+
+    const push = await this.ctx.storage.get<PushCredentials>("push");
+    if (!push) return;
+
+    // Check if push was invalidated
+    const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
+    if (pushInvalid) return;
+
+    this.lastPushAt = now;
+
+    // Extract preview from message (best-effort)
+    let body = "New message";
+    try {
+      const parsed = JSON.parse(messageData);
+      if (parsed.content) {
+        body = parsed.content.slice(0, 100);
+        if (parsed.content.length > 100) body += "\u2026";
+      }
+    } catch {
+      // Not parseable — use default
+    }
+
+    // Fire-and-forget — don't block message buffering on push delivery
+    this.ctx.waitUntil(
+      fetch(PUSH_SERVICE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          token: push.pushToken,
+          sendKey: push.sendKey,
+          platform: push.platform,
+          sandbox: push.sandbox,
+          title: "Claude",
+          body,
+          data: {
+            sessionId: this.session?.pluginSessionId,
+            type: "channel_message",
+          },
+        }),
+      })
+        .then(async (res) => {
+          // 403 = invalid sendKey — mark for re-registration
+          if (res.status === 403) {
+            await this.ctx.storage.put("pushInvalid", true);
+          }
+        })
+        .catch(() => {}), // Swallow errors — push is best-effort
+    );
+  }
+
+  // ── Session Init ────────────────────────────────────────────────────────────
+
   /**
    * Initialize a new pairing session. Called from POST /pair.
    */
@@ -126,6 +396,8 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
     return { code, sessionToken };
   }
+
+  // ── HTTP Fetch Handler ──────────────────────────────────────────────────────
 
   /**
    * HTTP fetch handler — used for the pairing code lookup.
@@ -201,7 +473,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
       // Clear all state
       this.session = null;
-      this.volatileBuffer = [];
       await this.ctx.storage.deleteAll();
 
       return Response.json({ ok: true, message: "Session revoked" });
@@ -211,6 +482,30 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     if (url.pathname === "/init" && request.method === "POST") {
       const { pluginSessionId } = await request.json<{ pluginSessionId: string }>();
       const result = await this.initSession(pluginSessionId);
+      return Response.json(result);
+    }
+
+    // POST /messages — HTTP catch-up endpoint (Phase 2)
+    if (url.pathname === "/messages" && request.method === "POST") {
+      const authHeader = request.headers.get("Authorization");
+      if (!authHeader?.startsWith("Bearer ")) {
+        return Response.json({ error: "Missing Authorization header" }, { status: 401 });
+      }
+      const token = authHeader.slice(7);
+
+      let afterSeq = 0;
+      try {
+        const body = await request.json<{ after?: number }>();
+        afterSeq = body.after ?? 0;
+      } catch {
+        // No body or invalid JSON — default to 0
+      }
+
+      const result = await this.getBufferedMessages(token, afterSeq);
+      if (!result) {
+        return Response.json({ error: "Invalid credentials" }, { status: 403 });
+      }
+
       return Response.json(result);
     }
 
@@ -253,6 +548,8 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     return Response.json({ error: "Not found" }, { status: 404 });
   }
 
+  // ── WebSocket Connection Handlers ───────────────────────────────────────────
+
   /**
    * Plugin connects with its session token.
    */
@@ -290,7 +587,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     }
 
     // Deliver buffered messages sent while plugin was disconnected
-    this.deliverBufferedMessages(server, "app");
+    await this.deliverBufferedMessages(server, "app");
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -388,8 +685,14 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       });
     }
 
+    // Check if push credentials need re-registration
+    const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
+    if (pushInvalid) {
+      trySendJson(server, { type: "push_reregister", timestamp: new Date().toISOString() });
+    }
+
     // Deliver buffered messages sent while app was disconnected
-    this.deliverBufferedMessages(server, "plugin");
+    await this.deliverBufferedMessages(server, "plugin");
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -478,7 +781,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         });
       }
 
-      this.deliverBufferedMessages(ws, "app");
+      await this.deliverBufferedMessages(ws, "app");
       return;
     }
 
@@ -561,7 +864,13 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         });
       }
 
-      this.deliverBufferedMessages(ws, "plugin");
+      // Check if push credentials need re-registration
+      const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
+      if (pushInvalid) {
+        trySendJson(ws, { type: "push_reregister", timestamp: new Date().toISOString() });
+      }
+
+      await this.deliverBufferedMessages(ws, "plugin");
       return;
     }
 
@@ -569,31 +878,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     ws.close(4001, "Auth required");
   }
 
-  /**
-   * Deliver buffered messages from a specific sender to the reconnected side.
-   */
-  private deliverBufferedMessages(ws: WebSocket, fromRole: WebSocketRole): void {
-    const toDeliver = this.volatileBuffer.filter((m) => m.from === fromRole);
-    for (const msg of toDeliver) {
-      try {
-        ws.send(msg.data);
-      } catch {
-        break;
-      }
-    }
-    this.volatileBuffer = this.volatileBuffer.filter((m) => m.from !== fromRole);
-  }
-
-  /**
-   * Buffer a message for reconnection delivery.
-   */
-  private bufferMessage(from: WebSocketRole, data: string): void {
-    this.volatileBuffer.push({ from, data, timestamp: Date.now() });
-    if (this.volatileBuffer.length > MESSAGE_BUFFER_SIZE) {
-      this.volatileBuffer.shift();
-    }
-    // Intentionally NOT persisted to storage — user content stays in memory only
-  }
+  // ── WebSocket Event Handlers ────────────────────────────────────────────────
 
   /**
    * WebSocket message handler (called by Durable Object runtime).
@@ -637,18 +922,50 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
     this.session.lastActivity = Date.now();
 
-    // Reset inactivity alarm
-    await this.ctx.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
-
-    // Parse for ping/pong handling
+    // Parse for protocol-level messages (ping/pong, catch_up, register_push)
     try {
       const parsed = JSON.parse(data);
+
       if (parsed.type === "ping") {
         ws.send(JSON.stringify({ type: "pong", timestamp: new Date().toISOString() }));
         return;
       }
+
+      // App-only protocol messages — intercepted, not forwarded
+      if (role === "app") {
+        if (parsed.type === "catch_up") {
+          const afterSeq = typeof parsed.afterSeq === "number" ? parsed.afterSeq : 0;
+          await this.deliverBufferedMessages(ws, "plugin", afterSeq);
+          // Reset inactivity alarm
+          await this.ctx.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
+          return;
+        }
+
+        if (parsed.type === "register_push") {
+          const creds: PushCredentials = {
+            pushToken: parsed.pushToken,
+            sendKey: parsed.sendKey,
+            platform: parsed.platform ?? "ios",
+            sandbox: parsed.sandbox ?? false,
+          };
+          await this.ctx.storage.put("push", creds);
+          // Clear any previous invalid flag since we have fresh credentials
+          await this.ctx.storage.delete("pushInvalid");
+          // Reset inactivity alarm
+          await this.ctx.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
+          return;
+        }
+      }
     } catch {
       // Not JSON, forward as-is
+    }
+
+    // Reset inactivity alarm (or extend if buffered messages exist)
+    const hasBuffered = await this.hasBufferedMessages();
+    if (hasBuffered) {
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_CHECK_INTERVAL_MS);
+    } else {
+      await this.ctx.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
     }
 
     // Forward to the other side
@@ -658,11 +975,19 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         target.send(data);
       } catch {
         // Target disconnected, buffer it
-        this.bufferMessage(role, data);
+        await this.bufferMessage(role, data);
+        // Send push notification if plugin → app and app is disconnected
+        if (role === "plugin") {
+          await this.maybeSendPush(data);
+        }
       }
     } else {
       // Other side not connected, buffer it
-      this.bufferMessage(role, data);
+      await this.bufferMessage(role, data);
+      // Send push notification if plugin → app and app is disconnected
+      if (role === "plugin") {
+        await this.maybeSendPush(data);
+      }
     }
   }
 
@@ -707,13 +1032,28 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
   }
 
   /**
-   * Alarm handler — cleanup inactive sessions.
+   * Alarm handler — cleanup inactive sessions, prune expired messages.
    */
   async alarm(): Promise<void> {
+    await this.ensureSession();
     if (!this.session) return;
 
-    // If no activity for the timeout period, clean up
-    if (Date.now() - this.session.lastActivity > INACTIVITY_TIMEOUT_MS) {
+    const now = Date.now();
+    const hasBuffered = await this.hasBufferedMessages();
+
+    if (hasBuffered) {
+      // Prune messages older than 24h
+      await this.pruneExpiredMessages(now - MESSAGE_TTL_MS);
+
+      // If still has messages after prune, reschedule alarm
+      if (await this.hasBufferedMessages()) {
+        await this.ctx.storage.setAlarm(now + ALARM_CHECK_INTERVAL_MS);
+        return;
+      }
+    }
+
+    // No buffered messages — apply standard inactivity timeout
+    if (now - this.session.lastActivity > INACTIVITY_TIMEOUT_MS) {
       // Close any remaining connections
       for (const ws of [this.pluginWs, this.appWs]) {
         try {
