@@ -542,6 +542,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     if (url.pathname === "/debug/push" && request.method === "GET") {
       const push = await this.ctx.storage.get<PushCredentials>("push");
       const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
+      const appMsgs = await this.ctx.storage.get<string[]>("_debug_app_msgs");
       return Response.json({
         hasCredentials: !!push,
         platform: push?.platform,
@@ -549,6 +550,9 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         tokenPrefix: push?.pushToken?.slice(0, 10),
         sendKeyPrefix: push?.sendKey?.slice(0, 10),
         pushInvalid: !!pushInvalid,
+        appWsConnected: this.appWs !== null,
+        pluginWsConnected: this.pluginWs !== null,
+        appMessages: appMsgs ?? [],
       });
     }
 
@@ -800,7 +804,9 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
    * Expects: { type: "auth", token: "...", id?: "..." } or { type: "auth", code: "..." }
    */
   private async handleAuthMessage(ws: WebSocket, tags: string[], data: string): Promise<void> {
-    console.error(`[DEBUG] handleAuthMessage tags=${tags.join(",")}`);
+    const prev = (await this.ctx.storage.get<string[]>("_debug_app_msgs")) ?? [];
+    prev.push(`${new Date().toISOString()} AUTH tags=${tags.join(",")}`);
+    await this.ctx.storage.put("_debug_app_msgs", prev.slice(-20));
     let parsed: { type?: string; token?: string; code?: string; id?: string };
     try {
       parsed = JSON.parse(data);
@@ -997,13 +1003,15 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
     this.session.lastActivity = Date.now();
 
-    // DEBUG: log all app messages to diagnose push registration
+    // DEBUG: log app messages to storage for diagnosis
     if (role === "app") {
       try {
         const dbg = JSON.parse(data);
-        console.error(`[DEBUG] App msg type=${dbg.type}`);
+        const prev = (await this.ctx.storage.get<string[]>("_debug_app_msgs")) ?? [];
+        prev.push(`${new Date().toISOString()} type=${dbg.type}`);
+        await this.ctx.storage.put("_debug_app_msgs", prev.slice(-20));
       } catch {
-        console.error(`[DEBUG] App msg (non-JSON) len=${data.length}`);
+        // ignore
       }
     }
 
