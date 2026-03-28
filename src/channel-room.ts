@@ -74,10 +74,7 @@ function parseSeqFromKey(key: string): number {
 }
 
 /** Sort comparator for [key, msg] entries by sequence number. */
-function compareBySeq(
-  a: [string, BufferedStorageMsg],
-  b: [string, BufferedStorageMsg],
-): number {
+function compareBySeq(a: [string, BufferedStorageMsg], b: [string, BufferedStorageMsg]): number {
   return parseSeqFromKey(a[0]) - parseSeqFromKey(b[0]);
 }
 
@@ -87,6 +84,15 @@ function trySendJson(ws: WebSocket, payload: Record<string, unknown>): void {
     ws.send(JSON.stringify(payload));
   } catch {
     // Peer already disconnected
+  }
+}
+
+/** Close a WebSocket gracefully, ignoring errors if already closed. */
+function tryClose(ws: WebSocket, code: number, reason: string): void {
+  try {
+    ws.close(code, reason);
+  } catch {
+    // Already closed
   }
 }
 
@@ -100,18 +106,59 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
   /** Memory cache for hasBufferedMessages — avoids 2 storage reads per message */
   private cachedHasBuffered: boolean | null = null;
 
+  /**
+   * Self-heal: scan live WebSockets for a role whose ref is null or stale.
+   * Returns the recovered WS (and updates the ref) or null if none found.
+   */
+  private healRoleRef(role: WebSocketRole): WebSocket | null {
+    const tagMatches = role === "plugin" ? ["plugin", "pending-plugin"] : ["app", "pending-app"];
+    for (const ws of this.ctx.getWebSockets()) {
+      const tags = this.ctx.getTags(ws);
+      if (tagMatches.some((t) => tags.includes(t))) {
+        if (role === "plugin") this.pluginWs = ws;
+        else this.appWs = ws;
+        return ws;
+      }
+    }
+    return null;
+  }
+
+  /** Replace a role's WebSocket, closing the stale one if it differs. */
+  private setRoleWs(role: WebSocketRole, ws: WebSocket): void {
+    const prev = role === "plugin" ? this.pluginWs : this.appWs;
+    if (prev && prev !== ws) tryClose(prev, 4010, "Replaced by new connection");
+    if (role === "plugin") this.pluginWs = ws;
+    else this.appWs = ws;
+  }
+
   constructor(ctx: DurableObjectState, env: { RELAY_SECRET: string }) {
     super(ctx, env);
 
     // Restore WebSocket references after hibernation.
     // The runtime keeps the connections alive but our in-memory
     // references (pluginWs, appWs) are lost when the DO is evicted.
+    // Multiple WSes per role can exist (stale connections from reconnects).
+    // Keep only the last one per role and close the rest.
+    const pluginWss: WebSocket[] = [];
+    const appWss: WebSocket[] = [];
     for (const ws of this.ctx.getWebSockets()) {
       const tags = this.ctx.getTags(ws);
       if (tags.includes("plugin") || tags.includes("pending-plugin")) {
-        this.pluginWs = ws;
+        pluginWss.push(ws);
       } else if (tags.includes("app") || tags.includes("pending-app")) {
-        this.appWs = ws;
+        appWss.push(ws);
+      }
+    }
+    if (pluginWss.length > 0) {
+      this.pluginWs = pluginWss[pluginWss.length - 1];
+      for (let i = 0; i < pluginWss.length - 1; i++) {
+        tryClose(pluginWss[i], 4010, "Stale connection after hibernation");
+      }
+    }
+    if (appWss.length > 0) {
+      this.appWs = appWss[appWss.length - 1];
+      for (let i = 0; i < appWss.length - 1; i++) {
+        tryClose(appWss[i], 4010, "Stale connection after hibernation");
       }
     }
   }
@@ -225,8 +272,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
     const pluginCount =
       ((await this.ctx.storage.get<number>("msgCount:plugin")) ?? 0) - pluginDeleted;
-    const appCount =
-      ((await this.ctx.storage.get<number>("msgCount:app")) ?? 0) - appDeleted;
+    const appCount = ((await this.ctx.storage.get<number>("msgCount:app")) ?? 0) - appDeleted;
 
     await this.ctx.storage.delete(toDelete.map(([key]) => key));
     await this.ctx.storage.put({
@@ -571,7 +617,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     const [client, server] = Object.values(pair);
 
     this.ctx.acceptWebSocket(server, ["plugin"]);
-    this.pluginWs = server;
+    this.setRoleWs("plugin", server);
 
     // Notify plugin of current state
     const paired = this.session.appSessionId !== null;
@@ -626,7 +672,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     const [client, server] = Object.values(pair);
 
     this.ctx.acceptWebSocket(server, ["app"]);
-    this.appWs = server;
+    this.setRoleWs("app", server);
 
     // Send pairing confirmation with app's session token and session ID
     // (session ID needed for reconnection — the outer worker uses it to find this DO)
@@ -667,7 +713,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     const [client, server] = Object.values(pair);
 
     this.ctx.acceptWebSocket(server, ["app"]);
-    this.appWs = server;
+    this.setRoleWs("app", server);
 
     // Send reconnection confirmation
     server.send(
@@ -766,7 +812,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
       // Authenticated — promote to full plugin connection
       // Note: Hibernation API doesn't support changing tags, so we track via the WS ref
-      this.pluginWs = ws;
+      this.setRoleWs("plugin", ws);
 
       const paired = this.session.appSessionId !== null;
       trySendJson(ws, {
@@ -813,7 +859,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       this.session.lastActivity = Date.now();
       await this.ctx.storage.put("session", this.session);
 
-      this.appWs = ws;
+      this.setRoleWs("app", ws);
 
       trySendJson(ws, {
         type: "paired",
@@ -849,7 +895,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         return;
       }
 
-      this.appWs = ws;
+      this.setRoleWs("app", ws);
 
       trySendJson(ws, {
         type: "reconnected",
@@ -969,24 +1015,40 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     }
 
     // Forward to the other side
-    const target = role === "plugin" ? this.appWs : this.pluginWs;
+    const targetRole: WebSocketRole = role === "plugin" ? "app" : "plugin";
+    let target = targetRole === "app" ? this.appWs : this.pluginWs;
+
     if (target) {
       try {
         target.send(data);
       } catch {
-        // Target disconnected, buffer it
-        await this.bufferMessage(role, data);
-        // Send push notification if plugin → app and app is disconnected
-        if (role === "plugin") {
-          await this.maybeSendPush(data);
+        // Target ref is stale — attempt self-heal before buffering
+        target = this.healRoleRef(targetRole);
+        if (target) {
+          try {
+            target.send(data);
+          } catch {
+            await this.bufferMessage(role, data);
+            if (role === "plugin") await this.maybeSendPush(data);
+          }
+        } else {
+          await this.bufferMessage(role, data);
+          if (role === "plugin") await this.maybeSendPush(data);
         }
       }
     } else {
-      // Other side not connected, buffer it
-      await this.bufferMessage(role, data);
-      // Send push notification if plugin → app and app is disconnected
-      if (role === "plugin") {
-        await this.maybeSendPush(data);
+      // No ref — attempt self-heal from live WebSockets
+      target = this.healRoleRef(targetRole);
+      if (target) {
+        try {
+          target.send(data);
+        } catch {
+          await this.bufferMessage(role, data);
+          if (role === "plugin") await this.maybeSendPush(data);
+        }
+      } else {
+        await this.bufferMessage(role, data);
+        if (role === "plugin") await this.maybeSendPush(data);
       }
     }
   }
@@ -1010,9 +1072,11 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     else return; // Pending connection that never authenticated — just drop it
     const partner = role === "plugin" ? this.appWs : this.pluginWs;
 
-    if (role === "plugin") {
+    // Only nullify the ref if the closing WS is the current one.
+    // Stale WebSockets from previous connections must not wipe the active ref.
+    if (role === "plugin" && ws === this.pluginWs) {
       this.pluginWs = null;
-    } else {
+    } else if (role === "app" && ws === this.appWs) {
       this.appWs = null;
     }
 
