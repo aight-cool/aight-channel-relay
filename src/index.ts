@@ -125,6 +125,16 @@ export default {
       }
     }
 
+    // ── GET /debug/push/:sessionId — check push state (temporary) ──
+    const debugPushMatch = url.pathname.match(/^\/debug\/push\/([0-9a-f]{32})$/);
+    if (debugPushMatch && request.method === "GET") {
+      const sessionId = debugPushMatch[1];
+      const doId = env.CHANNEL_ROOM.idFromName(sessionId);
+      const stub = env.CHANNEL_ROOM.get(doId);
+      const doResp = await stub.fetch(new Request("https://do/debug/push"));
+      return jsonResponse(await doResp.json());
+    }
+
     // ── POST /pair — Plugin requests a new pairing session ──
     if (url.pathname === "/pair" && request.method === "POST") {
       // Rate limit: 3 per 10 min per IP (prevents DO creation spam / denial-of-wallet)

@@ -538,6 +538,20 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       return Response.json({ ok: true, message: "Session revoked" });
     }
 
+    // GET /debug/push — check push credential state (temporary)
+    if (url.pathname === "/debug/push" && request.method === "GET") {
+      const push = await this.ctx.storage.get<PushCredentials>("push");
+      const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
+      return Response.json({
+        hasCredentials: !!push,
+        platform: push?.platform,
+        sandbox: push?.sandbox,
+        tokenPrefix: push?.pushToken?.slice(0, 10),
+        sendKeyPrefix: push?.sendKey?.slice(0, 10),
+        pushInvalid: !!pushInvalid,
+      });
+    }
+
     // POST /init — initialize session (called internally by worker)
     if (url.pathname === "/init" && request.method === "POST") {
       const { pluginSessionId } = await request.json<{ pluginSessionId: string }>();
