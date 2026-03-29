@@ -1031,6 +1031,8 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     if (target) {
       try {
         target.send(data);
+        // Always send push for plugin→app (testing — remove after verification)
+        if (role === "plugin") this.ctx.waitUntil(this.maybeSendPush(data));
       } catch {
         // Target ref is stale — attempt self-heal before buffering
         target = this.healRoleRef(targetRole);
