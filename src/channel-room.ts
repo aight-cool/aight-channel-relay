@@ -103,6 +103,9 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
   /** Volatile — fine to re-push after DO eviction */
   private lastPushAt = 0;
+
+  /** Last time lastActivity was persisted to storage (in-memory) */
+  private lastPersistedActivity: number | null = null;
   /** Memory cache for hasBufferedMessages — avoids 2 storage reads per message */
   private cachedHasBuffered: boolean | null = null;
 
@@ -368,27 +371,16 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
    */
   private async maybeSendPush(messageData: string): Promise<void> {
     const now = Date.now();
-    if (now - this.lastPushAt < PUSH_DEBOUNCE_MS) {
-      console.error("[Push] Debounced — skipping");
-      return;
-    }
+    if (now - this.lastPushAt < PUSH_DEBOUNCE_MS) return;
 
     const push = await this.ctx.storage.get<PushCredentials>("push");
-    if (!push) {
-      console.error("[Push] No push credentials in storage — register_push never received?");
-      return;
-    }
+    if (!push) return;
 
     // Check if push was invalidated
     const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
-    if (pushInvalid) {
-      console.error("[Push] Push credentials invalidated — waiting for re-register");
-      return;
-    }
+    if (pushInvalid) return;
 
     this.lastPushAt = now;
-
-    console.error("[Push] Sending push — token:", push.pushToken.slice(0, 10) + "...", "platform:", push.platform, "sandbox:", push.sandbox);
 
     // Extract preview from message (best-effort)
     let body = "New message";
@@ -421,15 +413,11 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         }),
       })
         .then(async (res) => {
-          const resBody = await res.text();
-          console.error("[Push] Response:", res.status, resBody);
           if (res.status === 403) {
             await this.ctx.storage.put("pushInvalid", true);
           }
         })
-        .catch((err) => {
-          console.error("[Push] Fetch error:", err);
-        }),
+        .catch(() => {}),
     );
   }
 
@@ -536,37 +524,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       await this.ctx.storage.deleteAll();
 
       return Response.json({ ok: true, message: "Session revoked" });
-    }
-
-    // GET /debug/push — check push credential state (temporary)
-    if (url.pathname === "/debug/push" && request.method === "GET") {
-      const push = await this.ctx.storage.get<PushCredentials>("push");
-      const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
-      const appMsgs = await this.ctx.storage.get<string[]>("_debug_app_msgs");
-      const allWs = this.ctx.getWebSockets();
-      const wsInfo = allWs.map((ws) => ({
-        tags: this.ctx.getTags(ws),
-        readyState: ws.readyState,
-      }));
-      const session = await this.ctx.storage.get("session");
-      const allKeys = await this.ctx.storage.list();
-      // Write a debug marker to verify storage works
-      await this.ctx.storage.put("_debug_check", Date.now());
-      return Response.json({
-        storageKeys: [...allKeys.keys()],
-        sessionInStorage: !!session,
-        hasCredentials: !!push,
-        platform: push?.platform,
-        sandbox: push?.sandbox,
-        tokenPrefix: push?.pushToken?.slice(0, 10),
-        sendKeyPrefix: push?.sendKey?.slice(0, 10),
-        pushInvalid: !!pushInvalid,
-        appWsRef: this.appWs !== null,
-        pluginWsRef: this.pluginWs !== null,
-        hibernatedWs: wsInfo,
-        sessionExists: this.session !== null,
-        appMessages: appMsgs ?? [],
-      });
     }
 
     // POST /init — initialize session (called internally by worker)
@@ -817,9 +774,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
    * Expects: { type: "auth", token: "...", id?: "..." } or { type: "auth", code: "..." }
    */
   private async handleAuthMessage(ws: WebSocket, tags: string[], data: string): Promise<void> {
-    const prev = (await this.ctx.storage.get<string[]>("_debug_app_msgs")) ?? [];
-    prev.push(`${new Date().toISOString()} AUTH tags=${tags.join(",")}`);
-    await this.ctx.storage.put("_debug_app_msgs", prev.slice(-20));
     let parsed: { type?: string; token?: string; code?: string; id?: string };
     try {
       parsed = JSON.parse(data);
@@ -1016,16 +970,12 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
 
     this.session.lastActivity = Date.now();
 
-    // DEBUG: log app messages to storage for diagnosis
-    if (role === "app") {
-      try {
-        const dbg = JSON.parse(data);
-        const prev = (await this.ctx.storage.get<string[]>("_debug_app_msgs")) ?? [];
-        prev.push(`${new Date().toISOString()} type=${dbg.type}`);
-        await this.ctx.storage.put("_debug_app_msgs", prev.slice(-20));
-      } catch {
-        // ignore
-      }
+    // Persist lastActivity every 5 minutes so the alarm doesn't nuke active sessions
+    // after DO eviction (lastActivity was only in-memory before this fix)
+    const PERSIST_INTERVAL_MS = 5 * 60_000;
+    if (this.session.lastActivity - (this.lastPersistedActivity ?? 0) > PERSIST_INTERVAL_MS) {
+      this.lastPersistedActivity = this.session.lastActivity;
+      this.ctx.waitUntil(this.ctx.storage.put("session", this.session));
     }
 
     // Parse for protocol-level messages (ping/pong, catch_up, register_push)
@@ -1048,7 +998,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         }
 
         if (parsed.type === "register_push") {
-          console.error("[Push] register_push received — token:", String(parsed.pushToken).slice(0, 10) + "...", "platform:", parsed.platform, "sandbox:", parsed.sandbox);
           const creds: PushCredentials = {
             pushToken: parsed.pushToken,
             sendKey: parsed.sendKey,
@@ -1082,8 +1031,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     if (target) {
       try {
         target.send(data);
-        // DEBUG: always send push for plugin→app messages (even when WS forward succeeds)
-        if (role === "plugin") this.ctx.waitUntil(this.maybeSendPush(data));
       } catch {
         // Target ref is stale — attempt self-heal before buffering
         target = this.healRoleRef(targetRole);
