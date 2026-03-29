@@ -550,6 +550,8 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       }));
       const session = await this.ctx.storage.get("session");
       const allKeys = await this.ctx.storage.list();
+      // Write a debug marker to verify storage works
+      await this.ctx.storage.put("_debug_check", Date.now());
       return Response.json({
         storageKeys: [...allKeys.keys()],
         sessionInStorage: !!session,
