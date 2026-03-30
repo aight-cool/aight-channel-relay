@@ -136,5 +136,5 @@ CI auto-deploys on push to `main` (configure in your CI provider).
   Native apps with no Origin header are allowed (defense-in-depth for REST endpoints).
 - **Input validation** — All user-supplied parameters validated against regexes before
   processing. Malformed inputs rejected with 400 before reaching Durable Objects.
-- **Message size limit** — 256KB max per WebSocket message.
+- **Message size limit** — 1MB max per WebSocket message.
 - **Session revocation** — `POST /revoke` closes all connections and deletes all state.

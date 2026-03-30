@@ -121,7 +121,7 @@ Then configure a custom domain in the Cloudflare dashboard if desired.
 - **Rate limiting** — `/pair` (3/10min/IP), code attempts (5/min/IP)
 - **Origin-restricted CORS** — only known origins allowed for browser requests
 - **Input validation** — all parameters validated against strict regexes before processing
-- **Message size limit** — 256KB per WebSocket message
+- **Message size limit** — 1MB per WebSocket message
 - **Session revocation** — `POST /revoke` closes all connections and deletes all state
 - **No user content on disk** — message buffers kept in volatile memory only
 

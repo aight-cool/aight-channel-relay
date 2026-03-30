@@ -173,6 +173,16 @@ export default {
       return jsonResponse(respData, doResp.status);
     }
 
+    // ── GET /debug-push/:sessionId — Check push state (temporary) ──
+    const debugPushMatch = url.pathname.match(/^\/debug-push\/([0-9a-f]{32})$/);
+    if (debugPushMatch && request.method === "GET") {
+      const sessionId = debugPushMatch[1];
+      const doId = env.CHANNEL_ROOM.idFromName(sessionId);
+      const stub = env.CHANNEL_ROOM.get(doId);
+      const doResp = await stub.fetch(new Request("https://do/debug-push"));
+      return jsonResponse(await doResp.json());
+    }
+
     // ── GET /ws/plugin — Plugin WebSocket ──
     if (url.pathname === "/ws/plugin" && request.method === "GET") {
       const sessionToken = url.searchParams.get("session");
@@ -196,6 +206,7 @@ export default {
         if (!SESSION_ID_RE.test(sessionId)) {
           return jsonResponse({ error: "Invalid parameter format" }, 400);
         }
+        console.log(`[WORKER] plugin connect: sessionId=${sessionId}`);
         // New: token-free URL — auth happens over WS as first message
         const doId = env.CHANNEL_ROOM.idFromName(sessionId);
         const stub = env.CHANNEL_ROOM.get(doId);

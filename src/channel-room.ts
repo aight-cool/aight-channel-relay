@@ -54,6 +54,7 @@ interface PushCredentials {
   sendKey: string;
   platform: string;
   sandbox: boolean;
+  channelName?: string;
 }
 
 type WebSocketRole = "plugin" | "app";
@@ -64,7 +65,7 @@ const MESSAGE_BUFFER_CAP = 100;
 const MESSAGE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 const ALARM_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
-const MAX_MESSAGE_SIZE = 256 * 1024; // 256KB max message size
+const MAX_MESSAGE_SIZE = 1024 * 1024; // 1MB max message size (CF DO WebSocket limit)
 const PUSH_DEBOUNCE_MS = 30_000;
 const PUSH_SERVICE_URL = "https://push.aight.cool/send";
 
@@ -371,28 +372,39 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
    */
   private async maybeSendPush(messageData: string): Promise<void> {
     const now = Date.now();
-    if (now - this.lastPushAt < PUSH_DEBOUNCE_MS) return;
+    if (now - this.lastPushAt < PUSH_DEBOUNCE_MS) {
+      console.log("[PUSH] debounced, skipping");
+      return;
+    }
 
     const push = await this.ctx.storage.get<PushCredentials>("push");
-    if (!push) return;
+    if (!push) {
+      console.log("[PUSH] no push credentials in storage");
+      return;
+    }
 
     // Check if push was invalidated
     const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
-    if (pushInvalid) return;
+    if (pushInvalid) {
+      console.log("[PUSH] credentials invalidated, skipping");
+      return;
+    }
 
+    console.log("[PUSH] sending push, token length:", push.pushToken.length, "platform:", push.platform, "sandbox:", push.sandbox);
     this.lastPushAt = now;
 
-    // Extract preview from message (best-effort)
-    let body = "New message";
+    // Only push for reply messages (skip tool events, typing, etc.)
+    let body: string | null = null;
     try {
       const parsed = JSON.parse(messageData);
-      if (parsed.content) {
+      if (parsed.type === "reply" && parsed.content) {
         body = parsed.content.slice(0, 100);
         if (parsed.content.length > 100) body += "\u2026";
       }
     } catch {
-      // Not parseable — use default
+      // Not parseable — skip
     }
+    if (!body) return;
 
     // Fire-and-forget — don't block message buffering on push delivery
     this.ctx.waitUntil(
@@ -404,7 +416,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
           sendKey: push.sendKey,
           platform: push.platform,
           sandbox: push.sandbox,
-          title: "Claude",
+          title: push.channelName || "Claude",
           body,
           data: {
             sessionId: this.session?.pluginSessionId,
@@ -413,11 +425,15 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         }),
       })
         .then(async (res) => {
+          console.log("[PUSH] push service response:", res.status);
           if (res.status === 403) {
+            console.log("[PUSH] sendKey invalid, marking pushInvalid");
             await this.ctx.storage.put("pushInvalid", true);
           }
         })
-        .catch(() => {}),
+        .catch((err) => {
+          console.log("[PUSH] push service error:", err instanceof Error ? err.message : String(err));
+        }),
     );
   }
 
@@ -591,6 +607,28 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       }
 
       return Response.json({ error: "Invalid parameters" }, { status: 400 });
+    }
+
+    // GET /debug-push — check push credentials state (temporary)
+    if (url.pathname === "/debug-push" && request.method === "GET") {
+      const push = await this.ctx.storage.get<PushCredentials>("push");
+      const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
+      const hasSession = !!this.session;
+      const pluginConnected = !!this.pluginWs;
+      const appConnected = !!this.appWs;
+      const allWs = this.ctx.getWebSockets().length;
+      return Response.json({
+        hasSession,
+        pluginConnected,
+        appConnected,
+        totalWebSockets: allWs,
+        hasPushCredentials: !!push,
+        pushTokenLength: push?.pushToken?.length ?? 0,
+        pushPlatform: push?.platform ?? null,
+        pushSandbox: push?.sandbox ?? null,
+        pushInvalid: pushInvalid ?? false,
+        lastPushAt: this.lastPushAt,
+      });
     }
 
     return Response.json({ error: "Not found" }, { status: 404 });
@@ -940,7 +978,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     if (data.length > MAX_MESSAGE_SIZE) {
       trySendJson(ws, {
         type: "error",
-        message: "Message too large (max 256KB)",
+        message: "Message too large (max 1MB)",
       });
       return;
     }
@@ -998,17 +1036,20 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         }
 
         if (parsed.type === "register_push") {
+          console.log("[PUSH] register_push received, token length:", parsed.pushToken?.length, "sendKey length:", parsed.sendKey?.length, "platform:", parsed.platform, "sandbox:", parsed.sandbox);
           const creds: PushCredentials = {
             pushToken: parsed.pushToken,
             sendKey: parsed.sendKey,
             platform: parsed.platform ?? "ios",
             sandbox: parsed.sandbox ?? false,
+            ...(parsed.channelName ? { channelName: parsed.channelName } : {}),
           };
           await this.ctx.storage.put("push", creds);
           // Clear any previous invalid flag since we have fresh credentials
           await this.ctx.storage.delete("pushInvalid");
           // Reset inactivity alarm
           await this.ctx.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
+          console.log("[PUSH] credentials stored successfully");
           return;
         }
       }
@@ -1031,8 +1072,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     if (target) {
       try {
         target.send(data);
-        // Always send push for plugin→app (testing — remove after verification)
-        if (role === "plugin") this.ctx.waitUntil(this.maybeSendPush(data));
       } catch {
         // Target ref is stale — attempt self-heal before buffering
         target = this.healRoleRef(targetRole);
