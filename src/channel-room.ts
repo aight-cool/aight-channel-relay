@@ -372,25 +372,15 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
    */
   private async maybeSendPush(messageData: string): Promise<void> {
     const now = Date.now();
-    if (now - this.lastPushAt < PUSH_DEBOUNCE_MS) {
-      console.log("[PUSH] debounced, skipping");
-      return;
-    }
+    if (now - this.lastPushAt < PUSH_DEBOUNCE_MS) return;
 
     const push = await this.ctx.storage.get<PushCredentials>("push");
-    if (!push) {
-      console.log("[PUSH] no push credentials in storage");
-      return;
-    }
+    if (!push) return;
 
     // Check if push was invalidated
     const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
-    if (pushInvalid) {
-      console.log("[PUSH] credentials invalidated, skipping");
-      return;
-    }
+    if (pushInvalid) return;
 
-    console.log("[PUSH] sending push, token length:", push.pushToken.length, "platform:", push.platform, "sandbox:", push.sandbox);
     this.lastPushAt = now;
 
     // Only push for reply messages (skip tool events, typing, etc.)
@@ -425,15 +415,11 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         }),
       })
         .then(async (res) => {
-          console.log("[PUSH] push service response:", res.status);
           if (res.status === 403) {
-            console.log("[PUSH] sendKey invalid, marking pushInvalid");
             await this.ctx.storage.put("pushInvalid", true);
           }
         })
-        .catch((err) => {
-          console.log("[PUSH] push service error:", err instanceof Error ? err.message : String(err));
-        }),
+        .catch(() => {}),
     );
   }
 
@@ -607,28 +593,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       }
 
       return Response.json({ error: "Invalid parameters" }, { status: 400 });
-    }
-
-    // GET /debug-push — check push credentials state (temporary)
-    if (url.pathname === "/debug-push" && request.method === "GET") {
-      const push = await this.ctx.storage.get<PushCredentials>("push");
-      const pushInvalid = await this.ctx.storage.get<boolean>("pushInvalid");
-      const hasSession = !!this.session;
-      const pluginConnected = !!this.pluginWs;
-      const appConnected = !!this.appWs;
-      const allWs = this.ctx.getWebSockets().length;
-      return Response.json({
-        hasSession,
-        pluginConnected,
-        appConnected,
-        totalWebSockets: allWs,
-        hasPushCredentials: !!push,
-        pushTokenLength: push?.pushToken?.length ?? 0,
-        pushPlatform: push?.platform ?? null,
-        pushSandbox: push?.sandbox ?? null,
-        pushInvalid: pushInvalid ?? false,
-        lastPushAt: this.lastPushAt,
-      });
     }
 
     return Response.json({ error: "Not found" }, { status: 404 });
@@ -1036,7 +1000,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         }
 
         if (parsed.type === "register_push") {
-          console.log("[PUSH] register_push received, token length:", parsed.pushToken?.length, "sendKey length:", parsed.sendKey?.length, "platform:", parsed.platform, "sandbox:", parsed.sandbox);
           const creds: PushCredentials = {
             pushToken: parsed.pushToken,
             sendKey: parsed.sendKey,
@@ -1049,7 +1012,6 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
           await this.ctx.storage.delete("pushInvalid");
           // Reset inactivity alarm
           await this.ctx.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
-          console.log("[PUSH] credentials stored successfully");
           return;
         }
       }
