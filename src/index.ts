@@ -56,13 +56,10 @@ function getCorsHeaders(request: Request): Record<string, string> {
   };
 }
 
-// Note: jsonResponse doesn't have request context for CORS.
-// WebSocket upgrades (the sensitive paths) don't use CORS anyway.
-// This is defense-in-depth for the REST endpoints only.
-function jsonResponse(data: unknown, status = 200): Response {
+function jsonResponse(data: unknown, status = 200, request?: Request): Response {
   return Response.json(data, {
     status,
-    headers: {
+    headers: request ? getCorsHeaders(request) : {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
@@ -89,7 +86,7 @@ export default {
 
     // Guard: RELAY_SECRET must be configured
     if (!env.RELAY_SECRET) {
-      return jsonResponse({ error: "Server misconfigured: RELAY_SECRET not set" }, 500);
+      return jsonResponse({ error: "Server configuration error" }, 500, request);
     }
 
     // Client IP for rate limiting
@@ -103,7 +100,10 @@ export default {
           sessionId: string;
         }>();
         if (!body.sessionToken || !body.sessionId) {
-          return jsonResponse({ error: "Missing sessionToken or sessionId" }, 400);
+          return jsonResponse({ error: "Missing sessionToken or sessionId" }, 400, request);
+        }
+        if (!SESSION_ID_RE.test(body.sessionId) || !SESSION_TOKEN_RE.test(body.sessionToken)) {
+          return jsonResponse({ error: "Invalid parameter format" }, 400, request);
         }
 
         const valid = await validateSessionToken(
@@ -112,16 +112,16 @@ export default {
           body.sessionToken,
         );
         if (!valid) {
-          return jsonResponse({ error: "Invalid credentials" }, 403);
+          return jsonResponse({ error: "Invalid credentials" }, 403, request);
         }
 
         // Forward revoke to the DO
         const doId = env.CHANNEL_ROOM.idFromName(body.sessionId);
         const stub = env.CHANNEL_ROOM.get(doId);
         const doResp = await stub.fetch(new Request("https://do/revoke", { method: "POST" }));
-        return jsonResponse(await doResp.json());
+        return jsonResponse(await doResp.json(), doResp.status, request);
       } catch {
-        return jsonResponse({ error: "Invalid request body" }, 400);
+        return jsonResponse({ error: "Invalid request body" }, 400, request);
       }
     }
 
@@ -136,7 +136,7 @@ export default {
       ) {
         return rateLimitResponse();
       }
-      return handlePair(env);
+      return handlePair(env, request);
     }
 
     // ── POST /messages/:sessionId — HTTP catch-up for buffered messages ──
@@ -170,7 +170,7 @@ export default {
 
       // Forward DO response with CORS headers
       const respData = await doResp.json();
-      return jsonResponse(respData, doResp.status);
+      return jsonResponse(respData, doResp.status, request);
     }
 
     // ── GET /ws/plugin — Plugin WebSocket ──
@@ -180,12 +180,12 @@ export default {
 
       if (sessionToken && sessionId) {
         if (!SESSION_TOKEN_RE.test(sessionToken) || !SESSION_ID_RE.test(sessionId)) {
-          return jsonResponse({ error: "Invalid parameter format" }, 400);
+          return jsonResponse({ error: "Invalid parameter format" }, 400, request);
         }
         // Legacy: token in URL (backwards compat)
         const valid = await validateSessionToken(env.RELAY_SECRET, sessionId, sessionToken);
         if (!valid) {
-          return jsonResponse({ error: "Invalid session token" }, 403);
+          return jsonResponse({ error: "Invalid session token" }, 403, request);
         }
         const doId = env.CHANNEL_ROOM.idFromName(sessionId);
         const stub = env.CHANNEL_ROOM.get(doId);
@@ -194,7 +194,7 @@ export default {
 
       if (sessionId) {
         if (!SESSION_ID_RE.test(sessionId)) {
-          return jsonResponse({ error: "Invalid parameter format" }, 400);
+          return jsonResponse({ error: "Invalid parameter format" }, 400, request);
         }
         // Token-free URL — auth happens over WS as first message
         const doId = env.CHANNEL_ROOM.idFromName(sessionId);
@@ -202,7 +202,7 @@ export default {
         return stub.fetch(request);
       }
 
-      return jsonResponse({ error: "Missing id parameter" }, 400);
+      return jsonResponse({ error: "Missing id parameter" }, 400, request);
     }
 
     // ── GET /ws/app — App WebSocket (pairing or reconnect) ──
@@ -212,7 +212,7 @@ export default {
 
       if (code) {
         if (!PAIRING_CODE_RE.test(code)) {
-          return jsonResponse({ error: "Invalid code format" }, 400);
+          return jsonResponse({ error: "Invalid code format" }, 400, request);
         }
         // Rate limit: 5 per min per IP (prevents pairing code brute force)
         if (
@@ -229,7 +229,7 @@ export default {
         const registry = env.CHANNEL_ROOM.get(registryId);
         const lookupResp = await registry.fetch(new Request(`https://do/lookup-code?code=${code}`));
         if (!lookupResp.ok) {
-          return jsonResponse({ error: "Invalid or expired pairing code" }, 403);
+          return jsonResponse({ error: "Invalid or expired pairing code" }, 403, request);
         }
         const { sessionId } = await lookupResp.json<{ sessionId: string }>();
 
@@ -243,7 +243,10 @@ export default {
         // Legacy reconnect: token in URL
         const sessionId = url.searchParams.get("id");
         if (!sessionId) {
-          return jsonResponse({ error: "Missing id parameter" }, 400);
+          return jsonResponse({ error: "Missing id parameter" }, 400, request);
+        }
+        if (!SESSION_TOKEN_RE.test(sessionToken) || !SESSION_ID_RE.test(sessionId)) {
+          return jsonResponse({ error: "Invalid parameter format" }, 400, request);
         }
 
         const doId = env.CHANNEL_ROOM.idFromName(sessionId);
@@ -251,24 +254,27 @@ export default {
         return stub.fetch(request);
       }
 
-      // New: token-free URL — just session ID, auth via first WS message
+      // Token-free URL — just session ID, auth via first WS message
       const sessionId = url.searchParams.get("id");
       if (sessionId) {
+        if (!SESSION_ID_RE.test(sessionId)) {
+          return jsonResponse({ error: "Invalid parameter format" }, 400, request);
+        }
         const doId = env.CHANNEL_ROOM.idFromName(sessionId);
         const stub = env.CHANNEL_ROOM.get(doId);
         return stub.fetch(request);
       }
 
-      return jsonResponse({ error: "Missing code, session, or id parameter" }, 400);
+      return jsonResponse({ error: "Missing code, session, or id parameter" }, 400, request);
     }
 
-    return jsonResponse({ error: "Not found" }, 404);
+    return jsonResponse({ error: "Not found" }, 404, request);
   },
 } satisfies ExportedHandler<Env>;
 
 // ── /pair handler ──
 
-async function handlePair(env: Env): Promise<Response> {
+async function handlePair(env: Env, request: Request): Promise<Response> {
   const sessionId = generateSessionId();
 
   const doId = env.CHANNEL_ROOM.idFromName(sessionId);
@@ -284,7 +290,7 @@ async function handlePair(env: Env): Promise<Response> {
 
   if (!doResponse.ok) {
     const err = await doResponse.text();
-    return jsonResponse({ error: `Session init failed: ${err}` }, 500);
+    return jsonResponse({ error: `Session init failed: ${err}` }, 500, request);
   }
 
   const { code, sessionToken } = await doResponse.json<{ code: string; sessionToken: string }>();
@@ -300,5 +306,5 @@ async function handlePair(env: Env): Promise<Response> {
     }),
   );
 
-  return jsonResponse({ code, sessionToken, sessionId });
+  return jsonResponse({ code, sessionToken, sessionId }, 200, request);
 }

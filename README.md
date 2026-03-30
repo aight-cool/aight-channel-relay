@@ -123,7 +123,7 @@ Then configure a custom domain in the Cloudflare dashboard if desired.
 - **Input validation** — all parameters validated against strict regexes before processing
 - **Message size limit** — 1MB per WebSocket message
 - **Session revocation** — `POST /revoke` closes all connections and deletes all state
-- **No user content on disk** — message buffers kept in volatile memory only
+- **Message buffer TTL** — buffered messages auto-expire after 12 hours, encrypted at rest
 
 ## Project Structure
 

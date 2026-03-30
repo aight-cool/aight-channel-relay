@@ -13,11 +13,11 @@
  *
  * Message buffering:
  *   Messages sent while the other side is disconnected are persisted to DO
- *   storage (survives eviction). Up to 100 messages, 24h TTL.
+ *   storage (survives eviction). Up to 100 messages, 12h TTL.
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { generateSessionToken, generatePairingCode, validateSessionToken } from "./auth";
+import { generateSessionToken, generatePairingCode, validateSessionToken, constantTimeEqual } from "./auth";
 
 /**
  * Code → sessionId registry entry.
@@ -62,7 +62,7 @@ const VALID_ROLES = new Set<string>(["plugin", "app"]);
 
 const PAIRING_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const MESSAGE_BUFFER_CAP = 100;
-const MESSAGE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MESSAGE_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 const ALARM_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const MAX_MESSAGE_SIZE = 1024 * 1024; // 1MB max message size (CF DO WebSocket limit)
@@ -651,7 +651,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
     }
 
     // Check pairing code
-    if (!this.session.pairingCode || this.session.pairingCode !== code) {
+    if (!this.session.pairingCode || !constantTimeEqual(this.session.pairingCode, code)) {
       return Response.json({ error: "Invalid pairing code" }, { status: 403 });
     }
 
@@ -842,7 +842,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         ws.close(4002, "No session");
         return;
       }
-      if (!this.session.pairingCode || this.session.pairingCode !== parsed.code) {
+      if (!this.session.pairingCode || !constantTimeEqual(this.session.pairingCode, parsed.code)) {
         trySendJson(ws, { type: "error", message: "Invalid pairing code" });
         ws.close(4003, "Auth failed");
         return;
@@ -992,7 +992,7 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
       // App-only protocol messages — intercepted, not forwarded
       if (role === "app") {
         if (parsed.type === "catch_up") {
-          const afterSeq = typeof parsed.afterSeq === "number" ? parsed.afterSeq : 0;
+          const afterSeq = typeof parsed.afterSeq === "number" ? Math.max(0, Math.floor(parsed.afterSeq)) : 0;
           await this.deliverBufferedMessages(ws, "plugin", afterSeq);
           // Reset inactivity alarm
           await this.ctx.storage.setAlarm(Date.now() + INACTIVITY_TIMEOUT_MS);
@@ -1000,12 +1000,16 @@ export class ChannelRoom extends DurableObject<{ RELAY_SECRET: string }> {
         }
 
         if (parsed.type === "register_push") {
+          const pushToken = typeof parsed.pushToken === "string" ? parsed.pushToken.slice(0, 200) : "";
+          const sendKey = typeof parsed.sendKey === "string" ? parsed.sendKey.slice(0, 200) : "";
+          if (!pushToken || !sendKey) return;
+          const platform = parsed.platform === "android" ? "android" : "ios";
           const creds: PushCredentials = {
-            pushToken: parsed.pushToken,
-            sendKey: parsed.sendKey,
-            platform: parsed.platform ?? "ios",
-            sandbox: parsed.sandbox ?? false,
-            ...(parsed.channelName ? { channelName: parsed.channelName } : {}),
+            pushToken,
+            sendKey,
+            platform,
+            sandbox: parsed.sandbox === true,
+            ...(typeof parsed.channelName === "string" ? { channelName: parsed.channelName.slice(0, 100) } : {}),
           };
           await this.ctx.storage.put("push", creds);
           // Clear any previous invalid flag since we have fresh credentials

@@ -17,8 +17,8 @@ with the Aight iOS app via a cloud relay. No LAN discovery, no port forwarding.
   one-time 6-digit pairing codes to session IDs. Codes are stored in DO storage and
   deleted after a single lookup.
 - **Persistent Storage**: Session state (pairing code, session IDs, timestamps) is
-  persisted to DO storage so it survives eviction. Message buffers are intentionally
-  kept in volatile memory only — user content is never written to disk.
+  persisted to DO storage so it survives eviction. Message buffers are persisted to
+  DO storage for offline delivery (12-hour TTL), encrypted at rest by Cloudflare.
 - **Rate Limiting** (`src/rate-limit.ts`): In-memory sliding-window counters. Resets
   when the Worker isolate recycles. Applied to `/pair` and `/ws/app?code=` endpoints.
 

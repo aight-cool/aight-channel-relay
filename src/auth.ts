@@ -29,9 +29,9 @@ export async function generateSessionToken(secret: string, sessionId: string): P
 }
 
 /**
- * Constant-time comparison of two hex strings.
+ * Constant-time comparison of two strings.
  */
-function constantTimeEqual(a: string, b: string): boolean {
+export function constantTimeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   const aBuf = encoder.encode(a);
   const bBuf = encoder.encode(b);
